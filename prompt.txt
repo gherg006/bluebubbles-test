@@ -1,0 +1,20 @@
+I want you to create me a login screen for a messaging app. This needs to have a login option and a register option.
+This does not need to be complicated at all, and only do what I say, coding it with an OOP approach.
+Make everything modular and comment your code properly.
+This will be in python. When the app is launched, the window pops up saying log in.
+This is a client-server structure so the user and password is stored in the server, the password hashed with no salt.
+The SSH into my server is 192.168.0.150 with the username zmacleod and the password 12345
+The postgres user for the app is bluebubbles and the password is 12345
+the postgres user for admin is postgres and the password is 12345
+The messages table and users tables are already created with the fields i want.
+You can use pgadmin if you want for managing the sql which i have installed already.
+Create as few files as possible. At a minimum i want a main.py, login_window.py, server_auth.py
+Create this as 2 seperate subfolders, one where i pull down to the client, and the other where i pull down to the server.
+
+Once a user is logged in, place them in a temporary window that will turn into the main chat window.
+
+Add no more logic than is needed, as for now this is all we need. 
+Once we have the login fully sorted and working only then can we start on the bulk of the program.
+DONT OVERCOMPLICATE ANYTHING, make minimal files and ensure that code looks human and isnt unnecessarily overcomplicated.
+This is just a small project that isnt going into production so security isnt a massive issue, dont worry about it too much.
+Explain your code with easy to understand comments.
