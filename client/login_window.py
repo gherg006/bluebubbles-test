@@ -48,16 +48,20 @@ class LoginWindow:                      #displays login or register then sends c
             row=6, column=0, columnspan=2, pady=(12, 0)
         )
 
-    def login(self):
-        """Ask the server to check the entered account details."""
+    def login(self):                    #Asks server to check account details
+        
         success, message = self._send_request("/login")
         if success:
             self._show_temporary_chat()
         else:
             self.status.set(message)
 
-    def register(self):
-        """Ask the server to save a new account."""
+    def register(self):                 #client request to server to save new account
+        username = self.username.get().strip()
+        if not username.isalpha() or not 2 <= len(username) <= 20:
+            self.status.set("Username must be between 2 and 20 letters.")
+            return
+
         success, message = self._send_request("/register")
         if success:
             self.password.set("")
@@ -65,8 +69,8 @@ class LoginWindow:                      #displays login or register then sends c
         else:
             self.status.set(message)
 
-    def _send_request(self, path):
-        """Send the form data as JSON and return the server response."""
+    def _send_request(self, path):         #sends form data in json format
+        
         if not self.username.get().strip() or not self.password.get():
             return False, "Enter a username and password."
 
@@ -87,8 +91,7 @@ class LoginWindow:                      #displays login or register then sends c
         except (URLError, TimeoutError, json.JSONDecodeError):
             return False, "Could not reach the server."
 
-    def _show_temporary_chat(self):
-        """Replace the login form with the temporary chat placeholder."""
+    def _show_temporary_chat(self):               #placeholder for the chat window. TBD
         self.form.destroy()
         self.root.title("BlueBubbles")
         chat = ttk.Frame(self.root, padding=24)
