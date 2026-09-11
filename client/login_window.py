@@ -9,11 +9,10 @@ from urllib.request import Request, urlopen
 
 
 # Change this environment variable if the server uses a different address.
-SERVER_URL = os.getenv("BLUEBUBBLES_SERVER_URL", "http://192.168.0.150:5432")
+SERVER_URL = os.getenv("BLUEBUBBLES_SERVER_URL", "http://192.168.0.150:5000")
 
 
-class LoginWindow:
-    """Displays login controls and sends requests to the auth server."""
+class LoginWindow:                      #displays login or register then sends creds to auth server
 
     def __init__(self, root):
         self.root = root
