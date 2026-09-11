@@ -29,12 +29,15 @@ class ServerAuth:
         ]
         for name, value in values.items():
             command.extend(["-v", f"{name}={value}"])
-        command.extend(["-c", query])
-
         environment = os.environ.copy()
         environment["PGPASSWORD"] = self.password
         return subprocess.run(
-            command, capture_output=True, text=True, env=environment, timeout=10
+            command,
+            input=query,
+            capture_output=True,
+            text=True,
+            env=environment,
+            timeout=10,
         )
 
     def login(self, username, password):
