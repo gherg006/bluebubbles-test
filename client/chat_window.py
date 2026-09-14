@@ -1,8 +1,8 @@
 import json
 import tkinter as tk
-from datetime import datetime
 from urllib.error import HTTPError, URLError
-from urllib.request import urlopen
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 
 # Match the sharp blue layout from the reference.
@@ -20,9 +20,11 @@ class ChatWindow:
         self.username = username
         self.server_url = server_url
         self.users = []
+        self.contacts = []
         self.message_text = tk.StringVar()
         self.search_text = tk.StringVar(value="Search")
         self.chat_title = tk.StringVar(value="Chat user")
+        self.recipient = None
 
         root.title("BlueBubbles")
         root.geometry("1080x650")
@@ -71,32 +73,58 @@ class ChatWindow:
         chat.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
         chat.grid_columnconfigure(0, weight=1)
         chat.grid_rowconfigure(1, weight=1)
-        tk.Label(chat, text="User1        min:hr   dd/mm/yyyy", bg=BACKGROUND, fg=TEXT, font=("Arial", 9, "bold")).grid(
+        tk.Label(
+            chat,
+            text=f"Logged in as: {self.username}",
+            bg=BACKGROUND,
+            fg=TEXT,
+            font=("Arial", 9, "bold"),
+        ).grid(
             row=0, column=0, sticky="w", pady=(0, 5)
         )
         self.messages = tk.Frame(chat, bg=WHITE, bd=1, relief="solid")
         self.messages.grid(row=1, column=0, sticky="nsew")
         self.messages.grid_columnconfigure(0, weight=1)
-        self._add_message("User1", "Choose an account from the users list to start chatting.", "", True)
+        self._show_empty_conversation()
 
         compose = tk.Frame(chat, bg=BACKGROUND, pady=8)
         compose.grid(row=2, column=0, sticky="ew")
         compose.grid_columnconfigure(0, weight=1)
         entry = tk.Entry(compose, textvariable=self.message_text, bg=WHITE, fg=TEXT, font=("Arial", 11), bd=1, relief="solid")
         entry.grid(row=0, column=0, sticky="ew", ipady=8)
-        entry.bind("<Return>", lambda event: self.send_message())
-        tk.Button(compose, text="+", command=self.send_message, bg=WHITE, fg="#6e8393", font=("Arial", 20), bd=1, relief="solid", width=2).grid(
+        entry.bind("<Return>", self._send_from_enter)
+        tk.Button(
+            compose,
+            text="Send",
+            command=self.send_message,
+            bg=BUTTON,
+            fg=TEXT,
+            font=("Arial", 10, "bold"),
+            bd=1,
+            relief="solid",
+            width=8,
+        ).grid(
             row=0, column=1, padx=(8, 0)
         )
 
     def _build_users(self, parent):
-        # Display every registered account in the narrow users column.
+        # Display only the accounts the user has chosen to message.
         users = tk.Frame(parent, bg=BACKGROUND)
         users.grid(row=1, column=1, sticky="nsew")
         users.grid_columnconfigure(0, weight=1)
         users.grid_rowconfigure(2, weight=1)
-        self._label(users, "Filter\n(dropdown)", 0, 0, pady=5, font=("Arial", 9))
-        tk.Label(users, text="Users", bg=PANEL, fg=TEXT, font=("Arial", 10, "bold")).grid(row=1, column=0, sticky="ew")
+        tk.Button(
+            users,
+            text="Add user",
+            command=self._open_add_user_menu,
+            bg=BUTTON,
+            fg=TEXT,
+            font=("Arial", 9, "bold"),
+            bd=1,
+            relief="solid",
+            pady=5,
+        ).grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        tk.Label(users, text="Messages", bg=PANEL, fg=TEXT, font=("Arial", 10, "bold")).grid(row=1, column=0, sticky="ew")
         self.user_list = tk.Listbox(users, bg=WHITE, fg=TEXT, font=("Arial", 10), bd=1, relief="solid", selectbackground="#8bbde0", activestyle="none")
         self.user_list.grid(row=2, column=0, sticky="nsew")
         self.user_list.bind("<<ListboxSelect>>", self._select_user)
@@ -115,7 +143,7 @@ class ChatWindow:
         tk.Label(parent, text=text, bg=BUTTON, fg=TEXT, bd=1, relief="solid", **options).grid(row=row, column=column, sticky="ew", pady=(0, 8))
 
     def _load_users(self):
-        # Ask the server for all registered usernames.
+        # Ask the server for usernames used by the add-user menu.
         try:
             with urlopen(f"{self.server_url}/users", timeout=5) as response:
                 self.users = json.loads(response.read().decode("utf-8")).get("users", [])
@@ -129,16 +157,16 @@ class ChatWindow:
             self.search_text.set("")
 
     def _filter_users(self, *args):
-        # Refresh the list with account names that match the search term.
+        # Refresh the message list with saved contacts that match the search term.
         query = self.search_text.get().lower()
-        matches = self.users if query == "search" else [user for user in self.users if query in user.lower()]
+        matches = self.contacts if query == "search" else [user for user in self.contacts if query in user.lower()]
         self.user_list.delete(0, "end")
         for user in matches:
             self.user_list.insert("end", user)
 
     def _sort_alphabetical(self):
-        # Sort the loaded usernames alphabetically.
-        self.users.sort(key=str.lower)
+        # Sort the selected contacts alphabetically.
+        self.contacts.sort(key=str.lower)
         self._filter_users()
 
     def _keep_order(self):
@@ -149,7 +177,77 @@ class ChatWindow:
         # Change the current chat label when a user is selected.
         selected = self.user_list.curselection()
         if selected:
-            self.chat_title.set(f"Chat user: {self.user_list.get(selected[0])}")
+            self._open_conversation(self.user_list.get(selected[0]))
+
+    def _open_add_user_menu(self):
+        # Show registered accounts only when the user chooses to add a contact.
+        menu = tk.Toplevel(self.root)
+        menu.title("Add user")
+        menu.resizable(False, False)
+        menu.configure(bg=BACKGROUND, padx=12, pady=12)
+
+        tk.Label(menu, text="Choose a user to message", bg=BACKGROUND, fg=TEXT).pack(anchor="w", pady=(0, 8))
+        search_text = tk.StringVar()
+        tk.Entry(menu, textvariable=search_text, bg=WHITE, fg=TEXT, bd=1, relief="solid", width=26).pack(pady=(0, 8))
+        user_picker = tk.Listbox(menu, bg=WHITE, fg=TEXT, bd=1, relief="solid", width=26, height=10)
+        user_picker.pack()
+
+        def show_matching_users(*args):
+            # Show only registered accounts that match the add-user search.
+            query = search_text.get().lower()
+            available = [
+                user for user in self.users
+                if user != self.username and user not in self.contacts and query in user.lower()
+            ]
+            user_picker.delete(0, "end")
+            for user in available:
+                user_picker.insert("end", user)
+
+        search_text.trace_add("write", show_matching_users)
+        show_matching_users()
+
+        def add_selected_user():
+            # Add the selected account to the main messages list.
+            selected = user_picker.curselection()
+            if not selected:
+                return
+            user = user_picker.get(selected[0])
+            self.contacts.append(user)
+            self._filter_users()
+            self._open_conversation(user)
+            menu.destroy()
+
+        tk.Button(menu, text="Add", command=add_selected_user, bg=BUTTON, fg=TEXT, bd=1, relief="solid", padx=18).pack(pady=(10, 0))
+
+    def _open_conversation(self, recipient):
+        # Load the selected account's saved conversation.
+        self.recipient = recipient
+        self.chat_title.set(f"Chat user: {recipient}")
+        parameters = urlencode({"username": self.username, "with": recipient})
+        try:
+            with urlopen(f"{self.server_url}/messages?{parameters}", timeout=5) as response:
+                saved_messages = json.loads(response.read().decode("utf-8")).get("messages", [])
+        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
+            saved_messages = []
+        self._clear_messages()
+        for message in saved_messages:
+            self._add_message(
+                message["sender"],
+                message["content"],
+                message["time"],
+                message["sender"] != self.username,
+            )
+        if not saved_messages:
+            self._add_message(recipient, "No messages yet.", "", True)
+
+    def _clear_messages(self):
+        # Remove all currently displayed message rows.
+        for child in self.messages.winfo_children():
+            child.destroy()
+
+    def _show_empty_conversation(self):
+        # Explain why the chat area is empty before an account is selected.
+        self._add_message("BlueBubbles", "Choose an account from the users list to start chatting.", "", True)
 
     def _add_message(self, sender, text, time, incoming):
         # Add a plain message line to the conversation area.
@@ -160,8 +258,26 @@ class ChatWindow:
         tk.Label(block, text=text, bg=WHITE, fg="#526b7e", font=("Arial", 10), justify="left", wraplength=430).pack(anchor="w", pady=(3, 0))
 
     def send_message(self):
-        # Show the new message locally until chat storage is added.
+        # Save the new plain-text message and refresh the conversation.
         text = self.message_text.get().strip()
-        if text:
-            self._add_message(self.username, text, datetime.now().strftime("%H:%M"), False)
-            self.message_text.set("")
+        if not text or not self.recipient:
+            return
+        data = json.dumps(
+            {"sender": self.username, "recipient": self.recipient, "content": text}
+        ).encode("utf-8")
+        request = Request(
+            f"{self.server_url}/messages",
+            data=data,
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urlopen(request, timeout=5):
+                self.message_text.set("")
+                self._open_conversation(self.recipient)
+        except (HTTPError, URLError, TimeoutError):
+            return
+
+    def _send_from_enter(self, event):
+        # Send the message when Enter is pressed in the message field.
+        self.send_message()
+        return "break"

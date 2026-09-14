@@ -1,4 +1,4 @@
-"""The simple login and registration screen shown by the client."""
+# The simple login and registration screen shown by the client.
 
 import json
 import os
@@ -14,7 +14,7 @@ from chat_window import ChatWindow
 SERVER_URL = os.getenv("BLUEBUBBLES_SERVER_URL", "http://192.168.0.150:5000")
 
 
-class LoginWindow:                      #displays login or register then sends creds to auth server
+class LoginWindow:                      # Displays login or register then sends creds to auth server
 
     def __init__(self, root):
         self.root = root
@@ -30,7 +30,7 @@ class LoginWindow:                      #displays login or register then sends c
         self._build_form()
 
     def _build_form(self):
-        """Create the two fields and the login/register buttons."""
+        #Create the two fields and the login/register buttons.
         ttk.Label(self.form, text="Log in", font=("Arial", 16, "bold")).grid(
             row=0, column=0, columnspan=2, pady=(0, 16)
         )
@@ -50,7 +50,7 @@ class LoginWindow:                      #displays login or register then sends c
             row=6, column=0, columnspan=2, pady=(12, 0)
         )
 
-    def login(self):                    #Asks server to check account details
+    def login(self):                    # Asks server to check account details
         
         success, message = self._send_request("/login")
         if success:
@@ -58,10 +58,10 @@ class LoginWindow:                      #displays login or register then sends c
         else:
             self.status.set(message)
 
-    def register(self):                 #client request to server to save new account
+    def register(self):                 # Client request to server to save new account
         username = self.username.get().strip()
-        if not username.isalpha() or not 2 <= len(username) <= 20:
-            self.status.set("Username must be between 2 and 20 letters.")
+        if not username.isalnum() or not 2 <= len(username) <= 20:
+            self.status.set("Username must be 2 to 20 letters or numbers.")
             return
 
         success, message = self._send_request("/register")
@@ -71,7 +71,7 @@ class LoginWindow:                      #displays login or register then sends c
         else:
             self.status.set(message)
 
-    def _send_request(self, path):         #sends form data in json format
+    def _send_request(self, path):         # Sends form data in json format
         
         if not self.username.get().strip() or not self.password.get():
             return False, "Enter a username and password."

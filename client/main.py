@@ -1,19 +1,19 @@
-"""Starting point for the BlueBubbles client."""
+# Start point for program
 
 import tkinter as tk
 
 from login_window import LoginWindow
 
 
-class ClientApplication:
-    """Creates and runs the client window."""
+class ClientApplication:         # Creates and runs window
+    
 
     def __init__(self):
         self.root = tk.Tk()
         LoginWindow(self.root)
 
-    def run(self):
-        """Keep the window open until the user closes it."""
+    def run(self):                # Keeps the window open
+        
         self.root.mainloop()
 
 

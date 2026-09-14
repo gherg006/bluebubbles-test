@@ -1,4 +1,4 @@
-"""Small HTTP server that handles BlueBubbles login and registration."""
+# HTTP server handling authentication
 
 import hashlib
 import os
@@ -6,9 +6,11 @@ import subprocess
 
 from flask import Flask, jsonify, request
 
+from message_system import MessageSystem
+
 
 class ServerAuth:
-    """Checks and creates users in the existing PostgreSQL users table."""
+    # Checks and creates postgres table
 
     def __init__(self):
         self.database = os.getenv("BLUEBUBBLES_DB_NAME", "Bluebubbles_app")
@@ -18,11 +20,11 @@ class ServerAuth:
 
     @staticmethod
     def _hash_password(password):
-        """Hash passwords as requested, without adding a salt."""
+        #hashes passwords
         return hashlib.sha256(password.encode("utf-8")).hexdigest()
 
     def _run_query(self, query, values):
-        """Run one parameterised query through the server's psql client."""
+        # Runs one query through the postgres client
         command = [
             "psql", "-X", "-q", "-t", "-A", "-h", self.host,
             "-U", self.user, "-d", self.database, "-v", "ON_ERROR_STOP=1",
@@ -41,7 +43,7 @@ class ServerAuth:
         )
 
     def login(self, username, password):
-        """Return True only when both saved credentials match."""
+        # Returns true when both creds match
         result = self._run_query(
             "SELECT 1 FROM users WHERE username = :'username' "
             "AND password_hash = :'password_hash' LIMIT 1;",
@@ -50,7 +52,7 @@ class ServerAuth:
         return result.returncode == 0 and result.stdout.strip() == "1"
 
     def register(self, username, password):
-        """Save a new user unless that username already exists."""
+        # Saves new user unless that username is already in use
         values = {"username": username, "password_hash": self._hash_password(password)}
         exists = self._run_query(
             "SELECT 1 FROM users WHERE username = :'username' LIMIT 1;", values
@@ -78,17 +80,18 @@ class ServerAuth:
 
 app = Flask(__name__)
 auth = ServerAuth()
+messages = MessageSystem(auth._run_query)
 
 
 def _credentials():
-    """Read the two required fields from an incoming JSON request."""
+    # Read the two fields in the json string
     data = request.get_json(silent=True) or {}
     return data.get("username", "").strip(), data.get("password", "")
 
 
 @app.post("/login")
 def login():
-    """Handle a login request from the client."""
+    # Handles login request from client
     username, password = _credentials()
     if not username or not password:
         return jsonify(success=False, message="Enter a username and password."), 400
@@ -99,7 +102,7 @@ def login():
 
 @app.post("/register")
 def register():
-    """Handle a registration request from the client."""
+    # Handles registration request from client
     username, password = _credentials()
     if not username or not password:
         return jsonify(success=False, message="Enter a username and password."), 400
@@ -112,6 +115,30 @@ def register():
 def users():
     # Return the registered usernames used by the client users list.
     return jsonify(users=auth.users())
+
+
+@app.get("/messages")
+def get_messages():
+    # Return the selected conversation for the logged-in user.
+    username = request.args.get("username", "").strip()
+    other_user = request.args.get("with", "").strip()
+    if not username or not other_user:
+        return jsonify(messages=[]), 400
+    return jsonify(messages=messages.conversation(username, other_user))
+
+
+@app.post("/messages")
+def send_message():
+    # Save one plain-text message for another registered account.
+    data = request.get_json(silent=True) or {}
+    sender = data.get("sender", "").strip()
+    recipient = data.get("recipient", "").strip()
+    content = data.get("content", "").strip()
+    if not sender or not recipient or not content:
+        return jsonify(success=False, message="Enter a recipient and message."), 400
+    if messages.send(sender, recipient, content):
+        return jsonify(success=True, message="Message sent."), 201
+    return jsonify(success=False, message="The message could not be sent."), 400
 
 
 if __name__ == "__main__":
