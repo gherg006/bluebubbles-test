@@ -7,6 +7,8 @@ from tkinter import ttk
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from chat_window import ChatWindow
+
 
 # Change this environment variable if the server uses a different address.
 SERVER_URL = os.getenv("BLUEBUBBLES_SERVER_URL", "http://192.168.0.150:5000")
@@ -91,10 +93,7 @@ class LoginWindow:                      #displays login or register then sends c
         except (URLError, TimeoutError, json.JSONDecodeError):
             return False, "Could not reach the server."
 
-    def _show_temporary_chat(self):               #placeholder for the chat window. TBD
+    def _show_temporary_chat(self):
+        # Replace the login form with the main chat interface.
         self.form.destroy()
-        self.root.title("BlueBubbles")
-        chat = ttk.Frame(self.root, padding=24)
-        chat.grid()
-        ttk.Label(chat, text=f"Welcome, {self.username.get()}!", font=("Arial", 16, "bold")).grid()
-        ttk.Label(chat, text="The chat window will be added next.").grid(pady=(10, 0))
+        ChatWindow(self.root, self.username.get(), SERVER_URL)

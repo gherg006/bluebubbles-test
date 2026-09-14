@@ -68,6 +68,13 @@ class ServerAuth:
             return False, "The server could not save the account."
         return True, "Account created."
 
+    def users(self):
+        # Return every registered username for the client user list.
+        result = self._run_query("SELECT username FROM users ORDER BY username;", {})
+        if result.returncode != 0:
+            return []
+        return [name for name in result.stdout.splitlines() if name]
+
 
 app = Flask(__name__)
 auth = ServerAuth()
@@ -99,6 +106,12 @@ def register():
 
     success, message = auth.register(username, password)
     return jsonify(success=success, message=message), 201 if success else 409
+
+
+@app.get("/users")
+def users():
+    # Return the registered usernames used by the client users list.
+    return jsonify(users=auth.users())
 
 
 if __name__ == "__main__":
