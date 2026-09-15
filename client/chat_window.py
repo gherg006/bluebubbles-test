@@ -11,6 +11,7 @@ PANEL = "#bdd9f1"
 BUTTON = "#a8d4ed"
 TEXT = "#1f3449"
 WHITE = "#ffffff"
+REFRESH_INTERVAL_MS = 1000
 
 
 class ChatWindow:
@@ -26,6 +27,7 @@ class ChatWindow:
         self.search_text = tk.StringVar(value="Search")
         self.chat_title = tk.StringVar(value="Chat user")
         self.recipient = None
+        self.current_messages = None
 
         root.title("BlueBubbles")
         root.geometry("1080x650")
@@ -33,6 +35,7 @@ class ChatWindow:
         root.configure(bg=WHITE)
         self._build_window()
         self._load_users()
+        self._schedule_message_refresh()
 
     def _build_window(self):
         # Keep the app box and separate sort box in the same arrangement as the image.
@@ -249,16 +252,28 @@ class ChatWindow:
         tk.Button(menu, text="Add", command=add_selected_user, bg=BUTTON, fg=TEXT, bd=1, relief="solid", padx=18).pack(pady=(10, 0))
 
     def _open_conversation(self, recipient):
-        # Load the selected account's saved conversation.
+        # Load the selected account's saved conversation immediately.
         self.recipient = recipient
+        self.current_messages = None
         self.send_status.set("")
         self.chat_title.set(f"Chat user: {recipient}")
-        parameters = urlencode({"username": self.username, "with": recipient})
+        self._refresh_conversation(scroll_to_latest=True)
+
+    def _fetch_conversation(self):
+        # Retrieve the active conversation without changing the visible chat.
+        parameters = urlencode({"username": self.username, "with": self.recipient})
         try:
             with urlopen(f"{self.server_url}/messages?{parameters}", timeout=5) as response:
-                saved_messages = json.loads(response.read().decode("utf-8")).get("messages", [])
+                return json.loads(response.read().decode("utf-8")).get("messages", [])
         except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
-            saved_messages = []
+            return None
+
+    def _refresh_conversation(self, scroll_to_latest=False):
+        # Redraw only when polling finds a new or changed message.
+        saved_messages = self._fetch_conversation()
+        if saved_messages is None or saved_messages == self.current_messages:
+            return
+        was_at_latest = self.message_canvas.yview()[1] >= 0.99
         self._clear_messages()
         for message in saved_messages:
             self._add_message(
@@ -268,8 +283,16 @@ class ChatWindow:
                 message["sender"] != self.username,
             )
         if not saved_messages:
-            self._add_message(recipient, "No messages yet.", "", True)
-        self._scroll_to_latest()
+            self._add_message(self.recipient, "No messages yet.", "", True)
+        self.current_messages = saved_messages
+        if scroll_to_latest or was_at_latest:
+            self._scroll_to_latest()
+
+    def _schedule_message_refresh(self):
+        # Check the open conversation regularly so another device's messages appear.
+        if self.recipient:
+            self._refresh_conversation()
+        self.root.after(REFRESH_INTERVAL_MS, self._schedule_message_refresh)
 
     def _clear_messages(self):
         # Remove all currently displayed message rows.
