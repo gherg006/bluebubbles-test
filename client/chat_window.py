@@ -35,6 +35,7 @@ class ChatWindow:
         root.configure(bg=WHITE)
         self._build_window()
         self._load_users()
+        self._load_contacts()
         self._schedule_message_refresh()
 
     def _build_window(self):
@@ -183,6 +184,16 @@ class ChatWindow:
             self.users = []
         self._filter_users()
 
+    def _load_contacts(self):
+        # Restore the contacts this account saved from a previous session or device.
+        parameters = urlencode({"username": self.username})
+        try:
+            with urlopen(f"{self.server_url}/contacts?{parameters}", timeout=5) as response:
+                self.contacts = json.loads(response.read().decode("utf-8")).get("contacts", [])
+        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
+            self.contacts = []
+        self._filter_users()
+
     def _clear_search_hint(self, event):
         # Remove the search hint when the field receives focus.
         if self.search_text.get() == "Search":
@@ -244,12 +255,29 @@ class ChatWindow:
             if not selected:
                 return
             user = user_picker.get(selected[0])
+            if not self._save_contact(user):
+                self.send_status.set("Could not save that user to your chats.")
+                return
             self.contacts.append(user)
             self._filter_users()
             self._open_conversation(user)
             menu.destroy()
 
         tk.Button(menu, text="Add", command=add_selected_user, bg=BUTTON, fg=TEXT, bd=1, relief="solid", padx=18).pack(pady=(10, 0))
+
+    def _save_contact(self, contact):
+        # Save an added user so the sidebar can be restored next time this user logs in.
+        data = json.dumps({"username": self.username, "contact": contact}).encode("utf-8")
+        request = Request(
+            f"{self.server_url}/contacts",
+            data=data,
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urlopen(request, timeout=5) as response:
+                return json.loads(response.read().decode("utf-8")).get("success", False)
+        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
+            return False
 
     def _open_conversation(self, recipient):
         # Load the selected account's saved conversation immediately.

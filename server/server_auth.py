@@ -77,9 +77,53 @@ class ServerAuth:
             return []
         return [name for name in result.stdout.splitlines() if name]
 
+    def create_contacts_table(self):
+        # Create the per-user contact list used to restore chat sidebars.
+        result = self._run_query(
+            "CREATE TABLE IF NOT EXISTS chat_contacts ("
+            "\"userID\" INTEGER NOT NULL REFERENCES users(\"userID\") ON DELETE CASCADE, "
+            "contact_id INTEGER NOT NULL REFERENCES users(\"userID\") ON DELETE CASCADE, "
+            "added_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+            "PRIMARY KEY (\"userID\", contact_id), "
+            "CHECK (\"userID\" <> contact_id)"
+            ");",
+            {},
+        )
+        return result.returncode == 0
+
+    def contacts(self, username):
+        # Return one account's saved sidebar contacts in the order they were added.
+        result = self._run_query(
+            "SELECT contact.username FROM chat_contacts saved "
+            "JOIN users owner ON owner.\"userID\" = saved.\"userID\" "
+            "JOIN users contact ON contact.\"userID\" = saved.contact_id "
+            "WHERE owner.username = :'username' "
+            "ORDER BY saved.added_at, contact.username;",
+            {"username": username},
+        )
+        if result.returncode != 0:
+            return []
+        return [name for name in result.stdout.splitlines() if name]
+
+    def add_contact(self, username, contact):
+        # Save a sidebar contact once, provided both accounts exist.
+        result = self._run_query(
+            "WITH owner AS (SELECT \"userID\" FROM users WHERE username = :'username'), "
+            "contact AS (SELECT \"userID\" FROM users WHERE username = :'contact'), "
+            "saved AS ("
+            "INSERT INTO chat_contacts (\"userID\", contact_id) "
+            "SELECT owner.\"userID\", contact.\"userID\" FROM owner CROSS JOIN contact "
+            "ON CONFLICT DO NOTHING"
+            ") "
+            "SELECT EXISTS (SELECT 1 FROM owner) AND EXISTS (SELECT 1 FROM contact);",
+            {"username": username, "contact": contact},
+        )
+        return result.returncode == 0 and result.stdout.strip() == "t"
+
 
 app = Flask(__name__)
 auth = ServerAuth()
+auth.create_contacts_table()
 messages = MessageSystem(auth._run_query)
 
 
@@ -115,6 +159,28 @@ def register():
 def users():
     # Return the registered usernames used by the client users list.
     return jsonify(users=auth.users())
+
+
+@app.get("/contacts")
+def get_contacts():
+    # Return the contacts that should remain in this account's sidebar.
+    username = request.args.get("username", "").strip()
+    if not username:
+        return jsonify(contacts=[]), 400
+    return jsonify(contacts=auth.contacts(username))
+
+
+@app.post("/contacts")
+def add_contact():
+    # Save an account to the caller's persistent sidebar.
+    data = request.get_json(silent=True) or {}
+    username = data.get("username", "").strip()
+    contact = data.get("contact", "").strip()
+    if not username or not contact or username == contact:
+        return jsonify(success=False, message="Choose another user to add."), 400
+    if auth.add_contact(username, contact):
+        return jsonify(success=True, message="Contact saved."), 201
+    return jsonify(success=False, message="The contact could not be saved."), 400
 
 
 @app.get("/messages")
