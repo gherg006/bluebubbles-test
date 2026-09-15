@@ -22,6 +22,7 @@ class ChatWindow:
         self.users = []
         self.contacts = []
         self.message_text = tk.StringVar()
+        self.send_status = tk.StringVar()
         self.search_text = tk.StringVar(value="Search")
         self.chat_title = tk.StringVar(value="Chat user")
         self.recipient = None
@@ -90,9 +91,10 @@ class ChatWindow:
         compose = tk.Frame(chat, bg=BACKGROUND, pady=8)
         compose.grid(row=2, column=0, sticky="ew")
         compose.grid_columnconfigure(0, weight=1)
-        entry = tk.Entry(compose, textvariable=self.message_text, bg=WHITE, fg=TEXT, font=("Arial", 11), bd=1, relief="solid")
-        entry.grid(row=0, column=0, sticky="ew", ipady=8)
-        entry.bind("<Return>", self._send_from_enter)
+        self.message_entry = tk.Entry(compose, textvariable=self.message_text, bg=WHITE, fg=TEXT, font=("Arial", 11), bd=1, relief="solid")
+        self.message_entry.grid(row=0, column=0, sticky="ew", ipady=8)
+        self.message_entry.bind("<Return>", self._send_from_enter)
+        self.message_entry.bind("<KP_Enter>", self._send_from_enter)
         tk.Button(
             compose,
             text="Send",
@@ -106,6 +108,13 @@ class ChatWindow:
         ).grid(
             row=0, column=1, padx=(8, 0)
         )
+        tk.Label(
+            compose,
+            textvariable=self.send_status,
+            bg=BACKGROUND,
+            fg="#9a2d27",
+            anchor="w",
+        ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(5, 0))
 
     def _build_users(self, parent):
         # Display only the accounts the user has chosen to message.
@@ -222,6 +231,7 @@ class ChatWindow:
     def _open_conversation(self, recipient):
         # Load the selected account's saved conversation.
         self.recipient = recipient
+        self.send_status.set("")
         self.chat_title.set(f"Chat user: {recipient}")
         parameters = urlencode({"username": self.username, "with": recipient})
         try:
@@ -260,7 +270,12 @@ class ChatWindow:
     def send_message(self):
         # Save the new plain-text message and refresh the conversation.
         text = self.message_text.get().strip()
-        if not text or not self.recipient:
+        if not self.recipient:
+            self.send_status.set("Choose a user before sending a message.")
+            return
+        if not text:
+            self.send_status.set("Write a message before sending.")
+            self.message_entry.focus_set()
             return
         data = json.dumps(
             {"sender": self.username, "recipient": self.recipient, "content": text}
@@ -271,11 +286,25 @@ class ChatWindow:
             headers={"Content-Type": "application/json"},
         )
         try:
-            with urlopen(request, timeout=5):
-                self.message_text.set("")
-                self._open_conversation(self.recipient)
-        except (HTTPError, URLError, TimeoutError):
+            with urlopen(request, timeout=5) as response:
+                body = json.loads(response.read().decode("utf-8"))
+        except HTTPError as error:
+            try:
+                body = json.loads(error.read().decode("utf-8"))
+                self.send_status.set(body.get("message", "Message could not be sent."))
+            except json.JSONDecodeError:
+                self.send_status.set("Message could not be sent.")
             return
+        except (URLError, TimeoutError, json.JSONDecodeError):
+            self.send_status.set("Could not reach the server. Try again.")
+            return
+
+        if not body.get("success"):
+            self.send_status.set(body.get("message", "Message could not be sent."))
+            return
+        self.message_text.set("")
+        self.send_status.set("")
+        self._open_conversation(self.recipient)
 
     def _send_from_enter(self, event):
         # Send the message when Enter is pressed in the message field.

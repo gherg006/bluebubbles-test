@@ -6,9 +6,8 @@ class MessageSystem:
     def send(self, sender, recipient, content):
         # Save a message only when both account names exist.
         result = self.run_query(
-            "INSERT INTO messages (message_id, sender_id, reciepient_id, message_content, sent_at) "
-            "SELECT COALESCE((SELECT MAX(message_id) + 1 FROM messages), 1), "
-            "sender.\"userID\", recipient.\"userID\", :'content', CURRENT_TIMESTAMP "
+            "INSERT INTO messages (sender_id, reciepient_id, message_content, sent_at) "
+            "SELECT sender.\"userID\", recipient.\"userID\", :'content', CURRENT_TIMESTAMP "
             "FROM users sender JOIN users recipient ON TRUE "
             "WHERE sender.username = :'sender' AND recipient.username = :'recipient' "
             "RETURNING message_id;",
