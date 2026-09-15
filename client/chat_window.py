@@ -83,9 +83,29 @@ class ChatWindow:
         ).grid(
             row=0, column=0, sticky="w", pady=(0, 5)
         )
-        self.messages = tk.Frame(chat, bg=WHITE, bd=1, relief="solid")
-        self.messages.grid(row=1, column=0, sticky="nsew")
+        message_area = tk.Frame(chat, bg=WHITE, bd=1, relief="solid")
+        message_area.grid(row=1, column=0, sticky="nsew")
+        message_area.grid_columnconfigure(0, weight=1)
+        message_area.grid_rowconfigure(0, weight=1)
+        self.message_canvas = tk.Canvas(message_area, bg=WHITE, highlightthickness=0)
+        self.message_canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar = tk.Scrollbar(
+            message_area,
+            orient="vertical",
+            command=self.message_canvas.yview,
+        )
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        self.message_canvas.configure(yscrollcommand=scrollbar.set)
+        self.messages = tk.Frame(self.message_canvas, bg=WHITE)
+        self.message_window = self.message_canvas.create_window(
+            (0, 0), window=self.messages, anchor="nw"
+        )
         self.messages.grid_columnconfigure(0, weight=1)
+        self.messages.bind("<Configure>", self._update_message_scroll_region)
+        self.message_canvas.bind("<Configure>", self._resize_message_frame)
+        self.root.bind_all("<MouseWheel>", self._scroll_messages)
+        self.root.bind_all("<Button-4>", self._scroll_messages)
+        self.root.bind_all("<Button-5>", self._scroll_messages)
         self._show_empty_conversation()
 
         compose = tk.Frame(chat, bg=BACKGROUND, pady=8)
@@ -249,11 +269,41 @@ class ChatWindow:
             )
         if not saved_messages:
             self._add_message(recipient, "No messages yet.", "", True)
+        self._scroll_to_latest()
 
     def _clear_messages(self):
         # Remove all currently displayed message rows.
         for child in self.messages.winfo_children():
             child.destroy()
+
+    def _update_message_scroll_region(self, event):
+        # Keep the scrollbar sized to the complete conversation.
+        self.message_canvas.configure(scrollregion=self.message_canvas.bbox("all"))
+
+    def _resize_message_frame(self, event):
+        # Keep the message rows as wide as the visible conversation area.
+        self.message_canvas.itemconfigure(self.message_window, width=event.width)
+
+    def _scroll_messages(self, event):
+        # Scroll only when the pointer is over the conversation, not other controls.
+        widget = event.widget
+        is_message_widget = widget == self.message_canvas
+        while not is_message_widget and widget is not None:
+            is_message_widget = widget == self.messages
+            widget = widget.master
+        if not is_message_widget:
+            return
+        if getattr(event, "delta", 0):
+            amount = -int(event.delta / 120)
+        else:
+            amount = -1 if event.num == 4 else 1
+        self.message_canvas.yview_scroll(amount, "units")
+        return "break"
+
+    def _scroll_to_latest(self):
+        # Show the most recent message after loading or sending a conversation.
+        self.root.update_idletasks()
+        self.message_canvas.yview_moveto(1)
 
     def _show_empty_conversation(self):
         # Explain why the chat area is empty before an account is selected.
