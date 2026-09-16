@@ -120,6 +120,17 @@ class ServerAuth:
         )
         return result.returncode == 0 and result.stdout.strip() == "t"
 
+    def delete_contact(self, username, contact):
+        # Delete only the selected contact that belongs to this account.
+        result = self._run_query(
+            "DELETE FROM chat_contacts "
+            "WHERE \"userID\" = (SELECT \"userID\" FROM users WHERE username = :'username') "
+            "AND contact_id = (SELECT \"userID\" FROM users WHERE username = :'contact') "
+            "RETURNING contact_id;",
+            {"username": username, "contact": contact},
+        )
+        return result.returncode == 0 and bool(result.stdout.strip())
+
 
 app = Flask(__name__)
 auth = ServerAuth()
@@ -181,6 +192,19 @@ def add_contact():
     if auth.add_contact(username, contact):
         return jsonify(success=True, message="Contact saved."), 201
     return jsonify(success=False, message="The contact could not be saved."), 400
+
+
+@app.delete("/contacts")
+def delete_contact():
+    # Remove a saved sidebar contact only for the account that owns it.
+    data = request.get_json(silent=True) or {}
+    username = data.get("username", "").strip()
+    contact = data.get("contact", "").strip()
+    if not username or not contact or username == contact:
+        return jsonify(success=False, message="Choose a contact to delete."), 400
+    if auth.delete_contact(username, contact):
+        return jsonify(success=True, message="Contact deleted.")
+    return jsonify(success=False, message="That contact could not be deleted."), 404
 
 
 @app.get("/messages")

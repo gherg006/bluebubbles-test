@@ -161,6 +161,10 @@ class ChatWindow:
         self.user_list = tk.Listbox(users, bg=WHITE, fg=TEXT, font=("Arial", 10), bd=1, relief="solid", selectbackground="#8bbde0", activestyle="none")
         self.user_list.grid(row=2, column=0, sticky="nsew")
         self.user_list.bind("<<ListboxSelect>>", self._select_user)
+        self.user_list.bind("<Button-3>", self._open_contact_menu)
+        self.contact_menu = tk.Menu(self.root, tearoff=0)
+        self.contact_menu.add_command(label="Delete", command=self._delete_selected_contact)
+        self.contact_menu.add_command(label="Pin (coming soon)", state="disabled")
 
     def _build_sorting(self, parent):
         # Keep the sorting actions in their own right-hand box.
@@ -221,6 +225,50 @@ class ChatWindow:
         selected = self.user_list.curselection()
         if selected:
             self._open_conversation(self.user_list.get(selected[0]))
+
+    def _open_contact_menu(self, event):
+        # Select the right-clicked contact before showing its actions.
+        index = self.user_list.nearest(event.y)
+        bounds = self.user_list.bbox(index)
+        if not bounds or not bounds[1] <= event.y <= bounds[1] + bounds[3]:
+            return
+        self.user_list.selection_clear(0, "end")
+        self.user_list.selection_set(index)
+        try:
+            self.contact_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.contact_menu.grab_release()
+
+    def _delete_selected_contact(self):
+        # Remove only the selected account from this user's saved chat list.
+        selected = self.user_list.curselection()
+        if not selected:
+            return
+        contact = self.user_list.get(selected[0])
+        data = json.dumps({"username": self.username, "contact": contact}).encode("utf-8")
+        request = Request(
+            f"{self.server_url}/contacts",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="DELETE",
+        )
+        try:
+            with urlopen(request, timeout=5) as response:
+                success = json.loads(response.read().decode("utf-8")).get("success", False)
+        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
+            success = False
+        if not success:
+            self.send_status.set("Could not delete that contact.")
+            return
+        self.contacts.remove(contact)
+        self._filter_users()
+        if self.recipient == contact:
+            self.recipient = None
+            self.current_messages = None
+            self.chat_title.set("Chat user")
+            self._clear_messages()
+            self._show_empty_conversation()
+            self._scroll_to_latest()
 
     def _open_add_user_menu(self):
         # Show registered accounts only when the user chooses to add a contact.
@@ -285,7 +333,7 @@ class ChatWindow:
         self.current_messages = None
         self.send_status.set("")
         self.chat_title.set(f"Chat user: {recipient}")
-        self._refresh_conversation(scroll_to_latest=True)
+        self._refresh_conversation(scroll_to_top=True)
 
     def _fetch_conversation(self):
         # Retrieve the active conversation without changing the visible chat.
@@ -296,7 +344,7 @@ class ChatWindow:
         except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
             return None
 
-    def _refresh_conversation(self, scroll_to_latest=False):
+    def _refresh_conversation(self, scroll_to_top=False, scroll_to_latest=False):
         # Redraw only when polling finds a new or changed message.
         saved_messages = self._fetch_conversation()
         if saved_messages is None or saved_messages == self.current_messages:
@@ -314,7 +362,9 @@ class ChatWindow:
         if not saved_messages:
             self._add_message(self.recipient, "No messages yet.", "", True)
         self.current_messages = saved_messages
-        if scroll_to_latest or was_at_latest:
+        if scroll_to_top:
+            self._scroll_to_top()
+        elif scroll_to_latest or was_at_latest:
             self._scroll_to_latest()
 
     def _schedule_message_refresh(self):
@@ -353,9 +403,14 @@ class ChatWindow:
         return "break"
 
     def _scroll_to_latest(self):
-        # Show the most recent message after loading or sending a conversation.
+        # Show the most recent message after sending or receiving a new one.
         self.root.update_idletasks()
         self.message_canvas.yview_moveto(1)
+
+    def _scroll_to_top(self):
+        # Start a newly opened conversation at its earliest saved message.
+        self.root.update_idletasks()
+        self.message_canvas.yview_moveto(0)
 
     def _show_empty_conversation(self):
         # Explain why the chat area is empty before an account is selected.
@@ -407,7 +462,7 @@ class ChatWindow:
             return
         self.message_text.set("")
         self.send_status.set("")
-        self._open_conversation(self.recipient)
+        self._refresh_conversation(scroll_to_latest=True)
 
     def _send_from_enter(self, event):
         # Send the message when Enter is pressed in the message field.
