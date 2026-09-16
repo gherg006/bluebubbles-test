@@ -309,6 +309,7 @@ class ChatWindow:
                 message["content"],
                 message["time"],
                 message["sender"] != self.username,
+                message.get("date", ""),
             )
         if not saved_messages:
             self._add_message(self.recipient, "No messages yet.", "", True)
@@ -360,12 +361,13 @@ class ChatWindow:
         # Explain why the chat area is empty before an account is selected.
         self._add_message("BlueBubbles", "Choose an account from the users list to start chatting.", "", True)
 
-    def _add_message(self, sender, text, time, incoming):
+    def _add_message(self, sender, text, time, incoming, sent_date=""):
         # Add a plain message line to the conversation area.
         row = self.messages.grid_size()[1]
         block = tk.Frame(self.messages, bg=WHITE)
         block.grid(row=row, column=0, sticky="w" if incoming else "e", padx=10, pady=(10, 0))
-        tk.Label(block, text=f"{sender}    {time}".strip(), bg=WHITE, fg=TEXT, font=("Arial", 9, "bold")).pack(anchor="w")
+        timestamp = " ".join(value for value in (sent_date, time) if value)
+        tk.Label(block, text=f"{sender}    {timestamp}".strip(), bg=WHITE, fg=TEXT, font=("Arial", 9, "bold")).pack(anchor="w")
         tk.Label(block, text=text, bg=WHITE, fg="#526b7e", font=("Arial", 10), justify="left", wraplength=430).pack(anchor="w", pady=(3, 0))
 
     def send_message(self):

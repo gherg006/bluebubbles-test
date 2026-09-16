@@ -19,6 +19,7 @@ class MessageSystem:
         # Return the messages shared by the two selected accounts.
         result = self.run_query(
             "SELECT sender.username, messages.message_content, "
+            "to_char(messages.sent_at, 'DD/MM/YYYY'), "
             "to_char(messages.sent_at, 'HH24:MI') "
             "FROM messages "
             "JOIN users sender ON sender.\"userID\" = messages.sender_id "
@@ -33,6 +34,13 @@ class MessageSystem:
 
         messages = []
         for row in result.stdout.splitlines():
-            sender, content, sent_at = row.split("|", 2)
-            messages.append({"sender": sender, "content": content, "time": sent_at})
+            sender, content, sent_date, sent_time = row.split("|", 3)
+            messages.append(
+                {
+                    "sender": sender,
+                    "content": content,
+                    "date": sent_date,
+                    "time": sent_time,
+                }
+            )
         return messages
