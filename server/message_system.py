@@ -78,7 +78,7 @@ class MessageSystem:
             return False
         result = self.run_query(
             "INSERT INTO messages "
-            "(sender_id, reciepient_id, message_content, sent_at, body_ciphertext, "
+            "(sender_id, recipient_id, message_content, sent_at, body_ciphertext, "
             "encryption_nonce, encryption_key_id, encryption_version, encrypted_at) "
             "SELECT sender.\"userID\", recipient.\"userID\", '', CURRENT_TIMESTAMP, "
             "decode(:'ciphertext', 'base64'), decode(:'nonce', 'base64'), "
@@ -110,7 +110,7 @@ class MessageSystem:
             "replace(encode(encryption_keys.wrapped_key, 'base64'), E'\\n', '') "
             "FROM messages "
             "JOIN users sender ON sender.\"userID\" = messages.sender_id "
-            "JOIN users recipient ON recipient.\"userID\" = messages.reciepient_id "
+            "JOIN users recipient ON recipient.\"userID\" = messages.recipient_id "
             "LEFT JOIN encryption_keys ON encryption_keys.id = messages.encryption_key_id "
             "WHERE (sender.username = :'username' AND recipient.username = :'other_user') "
             "OR (sender.username = :'other_user' AND recipient.username = :'username') "

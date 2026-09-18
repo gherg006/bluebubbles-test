@@ -51,6 +51,8 @@ class MessageEncryptionTests(unittest.TestCase):
         self.assertNotIn("content", self.database.insert_values)
         self.assertNotIn(original_content, self.database.insert_values.values())
         self.assertEqual(self.database.insert_values["encryption_key_id"], "7")
+        self.assertIn("recipient_id", self.database.last_query)
+        self.assertNotIn("reciepient_id", self.database.last_query)
 
         data_key = self.messages.key_store.unwrap(self.database.wrapped_key)
         decrypted_content = self.messages.encryptor.decrypt_message(
