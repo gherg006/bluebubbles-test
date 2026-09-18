@@ -2,7 +2,9 @@ import json
 import tkinter as tk
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from urllib.request import Request
+
+from transport import open_server
 
 
 # Match the sharp blue layout from the reference.
@@ -182,7 +184,7 @@ class ChatWindow:
     def _load_users(self):
         # Ask the server for usernames used by the add-user menu.
         try:
-            with urlopen(f"{self.server_url}/users", timeout=5) as response:
+            with open_server(f"{self.server_url}/users", timeout=5) as response:
                 self.users = json.loads(response.read().decode("utf-8")).get("users", [])
         except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
             self.users = []
@@ -192,7 +194,7 @@ class ChatWindow:
         # Restore the contacts this account saved from a previous session or device.
         parameters = urlencode({"username": self.username})
         try:
-            with urlopen(f"{self.server_url}/contacts?{parameters}", timeout=5) as response:
+            with open_server(f"{self.server_url}/contacts?{parameters}", timeout=5) as response:
                 self.contacts = json.loads(response.read().decode("utf-8")).get("contacts", [])
         except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
             self.contacts = []
@@ -253,7 +255,7 @@ class ChatWindow:
             method="DELETE",
         )
         try:
-            with urlopen(request, timeout=5) as response:
+            with open_server(request, timeout=5) as response:
                 success = json.loads(response.read().decode("utf-8")).get("success", False)
         except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
             success = False
@@ -322,7 +324,7 @@ class ChatWindow:
             headers={"Content-Type": "application/json"},
         )
         try:
-            with urlopen(request, timeout=5) as response:
+            with open_server(request, timeout=5) as response:
                 return json.loads(response.read().decode("utf-8")).get("success", False)
         except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
             return False
@@ -339,7 +341,7 @@ class ChatWindow:
         # Retrieve the active conversation without changing the visible chat.
         parameters = urlencode({"username": self.username, "with": self.recipient})
         try:
-            with urlopen(f"{self.server_url}/messages?{parameters}", timeout=5) as response:
+            with open_server(f"{self.server_url}/messages?{parameters}", timeout=5) as response:
                 return json.loads(response.read().decode("utf-8")).get("messages", [])
         except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
             return None
@@ -444,7 +446,7 @@ class ChatWindow:
             headers={"Content-Type": "application/json"},
         )
         try:
-            with urlopen(request, timeout=5) as response:
+            with open_server(request, timeout=5) as response:
                 body = json.loads(response.read().decode("utf-8"))
         except HTTPError as error:
             try:

@@ -7,6 +7,7 @@ import subprocess
 from flask import Flask, jsonify, request
 
 from message_system import MessageSystem
+from tls import tls_context
 
 
 class ServerAuth:
@@ -232,5 +233,6 @@ def send_message():
 
 
 if __name__ == "__main__":
-    # Listen on the server's network address so the client machine can connect.
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    # The API intentionally has no plaintext HTTP mode: every request uses TLS.
+    port = int(os.getenv("BLUEBUBBLES_PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, debug=False, ssl_context=tls_context())

@@ -1,17 +1,17 @@
 # The simple login and registration screen shown by the client.
 
 import json
-import os
 import tkinter as tk
 from tkinter import ttk
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 from chat_window import ChatWindow
+from transport import open_server, server_url
 
 
-# Change this environment variable if the server uses a different address.
-SERVER_URL = os.getenv("BLUEBUBBLES_SERVER_URL", "http://192.168.0.150:5000")
+# Change this environment variable if the server uses a different HTTPS address.
+SERVER_URL = server_url()
 
 
 class LoginWindow:                      # Displays login or register then sends creds to auth server
@@ -84,7 +84,7 @@ class LoginWindow:                      # Displays login or register then sends 
         )
 
         try:
-            with urlopen(request, timeout=5) as response:
+            with open_server(request, timeout=5) as response:
                 body = json.loads(response.read().decode("utf-8"))
                 return body["success"], body["message"]
         except HTTPError as error:
