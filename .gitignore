@@ -1,2 +1,2 @@
-bluebubbles-test/client/__pycache__/*.pyc
-bluebubbles-test/client/__pycache__/*.pyd
+__pycache__/
+*.py[cod]

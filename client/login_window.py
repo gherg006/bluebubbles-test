@@ -30,7 +30,7 @@ class LoginWindow:                      # Displays login or register then sends 
         self._build_form()
 
     def _build_form(self):
-        #Create the two fields and the login/register buttons.
+        # Create the two fields and the login/register buttons.
         ttk.Label(self.form, text="Log in", font=("Arial", 16, "bold")).grid(
             row=0, column=0, columnspan=2, pady=(0, 16)
         )

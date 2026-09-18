@@ -219,7 +219,7 @@ def get_messages():
 
 @app.post("/messages")
 def send_message():
-    # Save one plain-text message for another registered account.
+    # Save one encrypted message for another registered account.
     data = request.get_json(silent=True) or {}
     sender = data.get("sender", "").strip()
     recipient = data.get("recipient", "").strip()
