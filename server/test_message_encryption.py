@@ -16,6 +16,7 @@ class FakeDatabase:
         self.insert_values = None
 
     def run_query(self, query, values):
+        self.last_query = query
         if query.startswith("SELECT encryption_keys.id"):
             if self.wrapped_key is None:
                 return SimpleNamespace(returncode=0, stdout="")
@@ -57,6 +58,10 @@ class MessageEncryptionTests(unittest.TestCase):
             data_key,
         )
         self.assertEqual(decrypted_content, original_content)
+
+    def test_new_message_keeps_legacy_content_column_non_secret(self):
+        self.assertTrue(self.messages.send("alice", "bob", "Private text"))
+        self.assertIn("recipient.\"userID\", '', CURRENT_TIMESTAMP", self.database.last_query)
 
     def test_conversation_decrypts_new_rows_and_reads_legacy_rows(self):
         self.assertTrue(self.messages.send("alice", "bob", "Encrypted text"))

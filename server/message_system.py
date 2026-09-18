@@ -80,7 +80,7 @@ class MessageSystem:
             "INSERT INTO messages "
             "(sender_id, reciepient_id, message_content, sent_at, body_ciphertext, "
             "encryption_nonce, encryption_key_id, encryption_version, encrypted_at) "
-            "SELECT sender.\"userID\", recipient.\"userID\", NULL, CURRENT_TIMESTAMP, "
+            "SELECT sender.\"userID\", recipient.\"userID\", '', CURRENT_TIMESTAMP, "
             "decode(:'ciphertext', 'base64'), decode(:'nonce', 'base64'), "
             ":'encryption_key_id', 1, CURRENT_TIMESTAMP "
             "FROM users sender JOIN users recipient ON TRUE "
