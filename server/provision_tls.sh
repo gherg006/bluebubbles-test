@@ -20,6 +20,7 @@ server_csr="$tls_dir/server.csr"
 server_cert="$tls_dir/server-cert.pem"
 extensions="$tls_dir/server-extensions.cnf"
 
+install -d -o root -g "$service_user" -m 750 "$base_dir"
 install -d -m 700 "$ca_dir"
 # The CA remains root-only; the service only needs to traverse this directory
 # to read its own leaf certificate and private key.
@@ -46,6 +47,8 @@ chmod 640 "$server_key"
 chmod 644 "$server_cert" "$root_cert"
 chown root:"$service_user" "$tls_dir"
 chmod 750 "$tls_dir"
+chown root:"$service_user" "$base_dir"
+chmod 750 "$base_dir"
 rm -f "$server_csr" "$extensions"
 
 echo "TLS certificate installed at $server_cert"
