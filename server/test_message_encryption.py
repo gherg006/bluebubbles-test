@@ -18,6 +18,7 @@ class FakeDatabase:
     def run_query(self, query, values):
         self.last_query = query
         if query.startswith("SELECT encryption_keys.id"):
+            self.key_lookup_values = values
             if self.wrapped_key is None:
                 return SimpleNamespace(returncode=0, stdout="")
             return SimpleNamespace(returncode=0, stdout=f"7|{self.wrapped_key}\n")
@@ -62,6 +63,13 @@ class MessageEncryptionTests(unittest.TestCase):
     def test_new_message_keeps_legacy_content_column_non_secret(self):
         self.assertTrue(self.messages.send("alice", "bob", "Private text"))
         self.assertIn("recipient.\"userID\", '', CURRENT_TIMESTAMP", self.database.last_query)
+
+    def test_key_lookup_passes_the_recipient_scope_id(self):
+        self.assertTrue(self.messages.send("alice", "bob", "Private text"))
+        self.assertEqual(
+            self.database.key_lookup_values["scope_id"],
+            "75191771-cbb0-5172-b319-bcc684b67aef",
+        )
 
     def test_conversation_decrypts_new_rows_and_reads_legacy_rows(self):
         self.assertTrue(self.messages.send("alice", "bob", "Encrypted text"))

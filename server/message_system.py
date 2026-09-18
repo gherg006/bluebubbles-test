@@ -23,7 +23,7 @@ class MessageKeyStore:
             "AND encryption_keys.scope_id = :'scope_id' "
             "AND encryption_keys.status = 'active' "
             "ORDER BY encryption_keys.key_version DESC, encryption_keys.id DESC LIMIT 1;",
-            {"recipient": recipient},
+            {"recipient": recipient, "scope_id": scope_id},
         )
         if result.returncode != 0:
             return None
