@@ -7,7 +7,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request
 
 from chat_window import ChatWindow
-from transport import open_server, server_url
+from transport import connection_error_message, open_server, server_url
 
 
 # Change this environment variable if the server uses a different HTTPS address.
@@ -90,8 +90,10 @@ class LoginWindow:                      # Displays login or register then sends 
         except HTTPError as error:
             body = json.loads(error.read().decode("utf-8"))
             return False, body.get("message", "Request failed.")
-        except (URLError, TimeoutError, json.JSONDecodeError):
-            return False, "Could not reach the server."
+        except (URLError, TimeoutError) as error:
+            return False, connection_error_message(error)
+        except json.JSONDecodeError:
+            return False, "The server returned an invalid response."
 
     def _show_temporary_chat(self):
         # Replace the login form with the main chat interface.
