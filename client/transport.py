@@ -1,4 +1,4 @@
-"""HTTPS-only transport for all BlueBubbles client requests."""
+# HTTPS-only transport for all BlueBubbles client requests.
 
 import os
 import socket
@@ -13,11 +13,12 @@ _BUNDLED_CA_FILE = Path(__file__).with_name("certificates") / "bluebubbles-lan-r
 
 
 class TransportSecurityError(ValueError):
-    """Raised when the client is configured to use an insecure server URL."""
+    # Raised when the client is configured to use an insecure server URL.
+    pass
 
 
 def server_url():
-    """Return the configured HTTPS endpoint, rejecting plaintext HTTP outright."""
+    # Return the configured HTTPS endpoint, rejecting plaintext HTTP outright.
     url = os.getenv("BLUEBUBBLES_SERVER_URL", DEFAULT_SERVER_URL).rstrip("/")
     parsed = urlsplit(url)
     if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
@@ -29,7 +30,7 @@ def server_url():
 
 
 def _certificate_authority_file():
-    """Prefer an explicit CA, otherwise use the LAN CA packaged with the client."""
+    # Prefer an explicit CA, otherwise use the LAN CA packaged with the client.
     configured = os.getenv("BLUEBUBBLES_CA_CERT_FILE")
     if configured:
         return Path(configured)
@@ -37,7 +38,7 @@ def _certificate_authority_file():
 
 
 def ssl_context():
-    """Build a verifying TLS context; certificate and hostname checks stay enabled."""
+    # Build a verifying TLS context; certificate and hostname checks stay enabled.
     context = ssl.create_default_context()
     context.minimum_version = ssl.TLSVersion.TLSv1_2
     ca_file = _certificate_authority_file()
@@ -47,12 +48,12 @@ def ssl_context():
 
 
 def open_server(request, timeout=5):
-    """Open a request using the app's verified TLS context."""
+    # Open a request using the app's verified TLS context.
     return urlopen(request, timeout=timeout, context=ssl_context())
 
 
 def connection_error_message(error):
-    """Turn common secure-connection failures into actionable login feedback."""
+    # Turn common secure-connection failures into actionable login feedback.
     reason = getattr(error, "reason", error)
     if isinstance(reason, ssl.SSLCertVerificationError):
         return (
