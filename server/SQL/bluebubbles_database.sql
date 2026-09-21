@@ -1,9 +1,5 @@
 -- BlueBubbles server database schema backup.
---
--- This file is documentation/a backup only.  The application does not load or
--- execute it, and adding it does not change an existing PostgreSQL database.
--- It creates the tables and indexes required by the current server code, but
--- intentionally contains no user, message, or encryption-key data.
+
 
 BEGIN;
 

@@ -1,4 +1,4 @@
-"""Strict TLS configuration for the BlueBubbles HTTP API."""
+# Strict TLS configuration for the BlueBubbles HTTP API.
 
 import os
 import ssl
@@ -10,11 +10,12 @@ DEFAULT_KEY_FILE = "/etc/bluebubbles/tls/server-key.pem"
 
 
 class TLSConfigurationError(RuntimeError):
-    """Raised when the server cannot start with a secure TLS configuration."""
+    # Raised when the server cannot start with a secure TLS configuration.
+    pass
 
 
 def tls_context(environment=None):
-    """Return a TLS-1.2-or-newer server context, with no HTTP fallback."""
+    # Return a TLS-1.2-or-newer server context, with no HTTP fallback.
     environment = environment if environment is not None else os.environ
     certificate = Path(environment.get("BLUEBUBBLES_TLS_CERT_FILE", DEFAULT_CERT_FILE))
     private_key = Path(environment.get("BLUEBUBBLES_TLS_KEY_FILE", DEFAULT_KEY_FILE))
