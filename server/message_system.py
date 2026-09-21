@@ -8,7 +8,8 @@ from pathlib import Path
 from message_encryption import MessageEncryptor
 
 
-DEFAULT_UPLOAD_DIRECTORY = "/var/lib/bluebubbles/uploads"
+# Keep the default beside the service code so a non-root systemd user can write it.
+DEFAULT_UPLOAD_DIRECTORY = Path(__file__).with_name("uploads")
 DEFAULT_MAX_FILE_BYTES = 16 * 1024 * 1024
 
 
