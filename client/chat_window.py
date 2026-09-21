@@ -1,7 +1,9 @@
 import json
 import tkinter as tk
+import uuid
+from tkinter import filedialog
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from urllib.request import Request
 
 from transport import open_server
@@ -134,13 +136,23 @@ class ChatWindow:
         ).grid(
             row=0, column=1, padx=(8, 0)
         )
+        tk.Button(
+            compose,
+            text="Upload file",
+            command=self.upload_file,
+            bg=BUTTON,
+            fg=TEXT,
+            font=("Arial", 10, "bold"),
+            bd=1,
+            relief="solid",
+        ).grid(row=0, column=2, padx=(8, 0))
         tk.Label(
             compose,
             textvariable=self.send_status,
             bg=BACKGROUND,
             fg="#9a2d27",
             anchor="w",
-        ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(5, 0))
+        ).grid(row=1, column=0, columnspan=3, sticky="ew", pady=(5, 0))
 
     def _build_users(self, parent):
         # Display only the accounts the user has chosen to message.
@@ -360,6 +372,8 @@ class ChatWindow:
                 message["time"],
                 message["sender"] != self.username,
                 message.get("date", ""),
+                message.get("file_id"),
+                message.get("filename"),
             )
         if not saved_messages:
             self._add_message(self.recipient, "No messages yet.", "", True)
@@ -418,14 +432,26 @@ class ChatWindow:
         # Explain why the chat area is empty before an account is selected.
         self._add_message("BlueBubbles", "Choose an account from the users list to start chatting.", "", True)
 
-    def _add_message(self, sender, text, time, incoming, sent_date=""):
+    def _add_message(self, sender, text, time, incoming, sent_date="", file_id=None, filename=None):
         # Add a plain message line to the conversation area.
         row = self.messages.grid_size()[1]
         block = tk.Frame(self.messages, bg=WHITE)
         block.grid(row=row, column=0, sticky="w" if incoming else "e", padx=10, pady=(10, 0))
         timestamp = " ".join(value for value in (sent_date, time) if value)
         tk.Label(block, text=f"{sender}    {timestamp}".strip(), bg=WHITE, fg=TEXT, font=("Arial", 9, "bold")).pack(anchor="w")
-        tk.Label(block, text=text, bg=WHITE, fg="#526b7e", font=("Arial", 10), justify="left", wraplength=430).pack(anchor="w", pady=(3, 0))
+        if file_id and filename:
+            tk.Button(
+                block,
+                text=filename,
+                command=lambda: self._download_file(file_id, filename),
+                bg=BUTTON,
+                fg=TEXT,
+                font=("Arial", 10, "underline"),
+                bd=1,
+                relief="solid",
+            ).pack(anchor="w", pady=(3, 0))
+        else:
+            tk.Label(block, text=text, bg=WHITE, fg="#526b7e", font=("Arial", 10), justify="left", wraplength=430).pack(anchor="w", pady=(3, 0))
 
     def send_message(self):
         # Save the new plain-text message and refresh the conversation.
@@ -465,6 +491,82 @@ class ChatWindow:
         self.message_text.set("")
         self.send_status.set("")
         self._refresh_conversation(scroll_to_latest=True)
+
+    def upload_file(self):
+        # Keep the selected filename in encrypted message metadata; the blob uses a server UUID.
+        if not self.recipient:
+            self.send_status.set("Choose a user before uploading a file.")
+            return
+        path = filedialog.askopenfilename(parent=self.root)
+        if not path:
+            return
+        try:
+            with open(path, "rb") as selected_file:
+                contents = selected_file.read()
+            filename = path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+            data, content_type = self._multipart_file_request(
+                self.username, self.recipient, filename, contents
+            )
+        except OSError:
+            self.send_status.set("Could not read that file.")
+            return
+        request = Request(
+            f"{self.server_url}/files", data=data, headers={"Content-Type": content_type}
+        )
+        try:
+            with open_server(request, timeout=30) as response:
+                body = json.loads(response.read().decode("utf-8"))
+        except HTTPError as error:
+            try:
+                body = json.loads(error.read().decode("utf-8"))
+                self.send_status.set(body.get("message", "The file could not be uploaded."))
+            except json.JSONDecodeError:
+                self.send_status.set("The file could not be uploaded.")
+            return
+        except (URLError, TimeoutError, json.JSONDecodeError):
+            self.send_status.set("Could not reach the server. Try again.")
+            return
+        if not body.get("success"):
+            self.send_status.set(body.get("message", "The file could not be uploaded."))
+            return
+        self.send_status.set("")
+        self._refresh_conversation(scroll_to_latest=True)
+
+    @staticmethod
+    def _multipart_file_request(sender, recipient, filename, contents):
+        # Build a stdlib-only multipart body without putting file content in JSON or logs.
+        boundary = f"----BlueBubbles{uuid.uuid4().hex}"
+        encoded = bytearray()
+        for name, value in (("sender", sender), ("recipient", recipient)):
+            encoded.extend(f"--{boundary}\r\n".encode("ascii"))
+            encoded.extend(
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode("utf-8")
+            )
+        encoded.extend(f"--{boundary}\r\n".encode("ascii"))
+        encoded.extend(
+            f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'.encode("utf-8")
+        )
+        encoded.extend(b"Content-Type: application/octet-stream\r\n\r\n")
+        encoded.extend(contents)
+        encoded.extend(f"\r\n--{boundary}--\r\n".encode("ascii"))
+        return bytes(encoded), f"multipart/form-data; boundary={boundary}"
+
+    def _download_file(self, file_id, filename):
+        # The server returns decrypted bytes only after checking this user is a participant.
+        target = filedialog.asksaveasfilename(parent=self.root, initialfile=filename)
+        if not target:
+            return
+        parameters = urlencode({"username": self.username})
+        request = Request(f"{self.server_url}/files/{quote(file_id)}?{parameters}")
+        try:
+            with open_server(request, timeout=30) as response:
+                contents = response.read()
+            with open(target, "wb") as downloaded_file:
+                downloaded_file.write(contents)
+        except (OSError, HTTPError, URLError, TimeoutError):
+            self.send_status.set("Could not download that file.")
+            return
+        self.send_status.set("")
 
     def _send_from_enter(self, event):
         # Send the message when Enter is pressed in the message field.

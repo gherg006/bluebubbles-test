@@ -15,6 +15,7 @@ class MessageEncryptor:
     _key_size = 32
     _key_wrap_aad = b"bluebubbles:message-key:v1"
     _message_aad = b"bluebubbles:message:v1"
+    _file_aad = b"bluebubbles:file:v1"
 
     def __init__(self, environment=None):
         self.environment = environment if environment is not None else os.environ
@@ -54,6 +55,20 @@ class MessageEncryptor:
         return AESGCM(data_key).decrypt(
             nonce, ciphertext, self._message_aad
         ).decode("utf-8")
+
+    def encrypt_file(self, contents, data_key):
+        # Prefix the nonce so a UUID-addressed blob is independently decryptable.
+        nonce = os.urandom(self._nonce_size)
+        return nonce + AESGCM(data_key).encrypt(nonce, contents, self._file_aad)
+
+    def decrypt_file(self, encrypted_contents, data_key):
+        # Reject truncated and tampered encrypted files before returning any bytes.
+        if len(encrypted_contents) <= self._nonce_size:
+            raise ValueError("Encrypted file is invalid.")
+        nonce = encrypted_contents[:self._nonce_size]
+        return AESGCM(data_key).decrypt(
+            nonce, encrypted_contents[self._nonce_size:], self._file_aad
+        )
 
     def _master_key(self):
         encoded_key = self.environment.get("BLUEBUBBLES_MESSAGE_MASTER_KEY", "")

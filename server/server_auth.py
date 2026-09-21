@@ -3,6 +3,7 @@
 import hashlib
 import os
 import subprocess
+from pathlib import Path
 
 from flask import Flask, jsonify, request
 
@@ -92,6 +93,15 @@ class ServerAuth:
         )
         return result.returncode == 0
 
+    def create_file_upload_schema(self):
+        # Apply the small additive migration for UUID-backed file messages.
+        migration = Path(__file__).with_name("SQL") / "002_add_file_uploads.sql"
+        try:
+            query = migration.read_text(encoding="utf-8")
+        except OSError:
+            return False
+        return self._run_query(query, {}).returncode == 0
+
     def contacts(self, username):
         # Return one account's saved sidebar contacts in the order they were added.
         result = self._run_query(
@@ -136,6 +146,8 @@ class ServerAuth:
 app = Flask(__name__)
 auth = ServerAuth()
 auth.create_contacts_table()
+if not auth.create_file_upload_schema():
+    raise RuntimeError("The file upload database migration could not be applied.")
 messages = MessageSystem(auth._run_query)
 
 
@@ -230,6 +242,37 @@ def send_message():
     if messages.send(sender, recipient, content):
         return jsonify(success=True, message="Message sent."), 201
     return jsonify(success=False, message="The message could not be sent."), 400
+
+
+@app.post("/files")
+def upload_file():
+    # Store a multipart file as an encrypted message and encrypted UUID-addressed blob.
+    sender = request.form.get("sender", "").strip()
+    recipient = request.form.get("recipient", "").strip()
+    uploaded_file = request.files.get("file")
+    if not sender or not recipient or uploaded_file is None or not uploaded_file.filename:
+        return jsonify(success=False, message="Choose a recipient and file."), 400
+    contents = uploaded_file.read(messages.file_storage.max_file_bytes + 1)
+    if len(contents) > messages.file_storage.max_file_bytes:
+        return jsonify(success=False, message="The file is too large."), 413
+    file_id = messages.send_file(sender, recipient, uploaded_file.filename, contents)
+    if not file_id:
+        return jsonify(success=False, message="The file could not be uploaded."), 400
+    return jsonify(success=True, file_id=file_id, message="File uploaded."), 201
+
+
+@app.get("/files/<file_id>")
+def download_file(file_id):
+    # The message participants alone can retrieve and decrypt the UUID-addressed file.
+    username = request.args.get("username", "").strip()
+    if not username:
+        return jsonify(success=False, message="Enter a username."), 400
+    contents = messages.retrieve_file(username, file_id)
+    if contents is None:
+        return jsonify(success=False, message="The file is unavailable."), 404
+    response = app.response_class(contents, mimetype="application/octet-stream")
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 if __name__ == "__main__":

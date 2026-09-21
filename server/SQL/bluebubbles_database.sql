@@ -36,7 +36,9 @@ CREATE TABLE IF NOT EXISTS messages (
     encryption_nonce BYTEA,
     encryption_key_id INTEGER REFERENCES encryption_keys(id),
     encryption_version INTEGER,
-    encrypted_at TIMESTAMP
+    encrypted_at TIMESTAMP,
+    message_type TEXT NOT NULL DEFAULT 'text' CHECK (message_type IN ('text', 'file')),
+    attachment_uuid UUID
 );
 
 CREATE TABLE IF NOT EXISTS chat_contacts (
@@ -52,5 +54,8 @@ CREATE INDEX IF NOT EXISTS encryption_keys_active_scope_lookup_idx
 
 CREATE INDEX IF NOT EXISTS messages_conversation_lookup_idx
     ON messages (sender_id, recipient_id, sent_at, message_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS messages_attachment_uuid_unique_idx
+    ON messages (attachment_uuid) WHERE attachment_uuid IS NOT NULL;
 
 COMMIT;
