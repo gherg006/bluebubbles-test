@@ -1,7 +1,10 @@
 import json
+import hashlib
 import os
+import tempfile
 import tkinter as tk
 import uuid
+from pathlib import Path
 from tkinter import filedialog, ttk
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
@@ -17,16 +20,18 @@ BUTTON = "#a8d4ed"
 TEXT = "#1f3449"
 WHITE = "#ffffff"
 REFRESH_INTERVAL_MS = 1000
+MAXIMUM_FILE_BYTES = 2 * 1024 * 1024 * 1024
+FILE_TRANSFER_TIMEOUT_SECONDS = 60 * 60
 
 
 class MultipartFileBody:
     # Stream one attachment so progress can advance while urllib sends it.
     _chunk_size = 64 * 1024
 
-    def __init__(self, sender, recipient, filename, path, progress_callback):
+    def __init__(self, recipient, filename, path, checksum, progress_callback):
         boundary = f"----BlueBubbles{uuid.uuid4().hex}"
         self.content_type = f"multipart/form-data; boundary={boundary}"
-        self._prefix = self._headers(boundary, sender, recipient, filename)
+        self._prefix = self._headers(boundary, recipient, filename, checksum)
         self._suffix = f"\r\n--{boundary}--\r\n".encode("ascii")
         self._file = open(path, "rb")
         self._file_size = os.path.getsize(path)
@@ -35,9 +40,9 @@ class MultipartFileBody:
         self._sent_file_bytes = 0
 
     @staticmethod
-    def _headers(boundary, sender, recipient, filename):
+    def _headers(boundary, recipient, filename, checksum):
         encoded = bytearray()
-        for name, value in (("sender", sender), ("recipient", recipient)):
+        for name, value in (("recipient", recipient), ("checksum", checksum)):
             encoded.extend(f"--{boundary}\r\n".encode("ascii"))
             encoded.extend(
                 f'Content-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode("utf-8")
@@ -297,9 +302,8 @@ class ChatWindow:
 
     def _load_contacts(self):
         # Restore the contacts this account saved from a previous session or device.
-        parameters = urlencode({"username": self.username})
         try:
-            with open_server(f"{self.server_url}/contacts?{parameters}", timeout=5) as response:
+            with open_server(f"{self.server_url}/contacts", timeout=5) as response:
                 self.contacts = json.loads(response.read().decode("utf-8")).get("contacts", [])
         except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
             self.contacts = []
@@ -352,7 +356,7 @@ class ChatWindow:
         if not selected:
             return
         contact = self.user_list.get(selected[0])
-        data = json.dumps({"username": self.username, "contact": contact}).encode("utf-8")
+        data = json.dumps({"contact": contact}).encode("utf-8")
         request = Request(
             f"{self.server_url}/contacts",
             data=data,
@@ -422,7 +426,7 @@ class ChatWindow:
 
     def _save_contact(self, contact):
         # Save an added user so the sidebar can be restored next time this user logs in.
-        data = json.dumps({"username": self.username, "contact": contact}).encode("utf-8")
+        data = json.dumps({"contact": contact}).encode("utf-8")
         request = Request(
             f"{self.server_url}/contacts",
             data=data,
@@ -444,7 +448,7 @@ class ChatWindow:
 
     def _fetch_conversation(self):
         # Retrieve the active conversation without changing the visible chat.
-        parameters = urlencode({"username": self.username, "with": self.recipient})
+        parameters = urlencode({"with": self.recipient})
         try:
             with open_server(f"{self.server_url}/messages?{parameters}", timeout=5) as response:
                 return json.loads(response.read().decode("utf-8")).get("messages", [])
@@ -568,7 +572,7 @@ class ChatWindow:
     def _send_text_message(self, text):
         # Keep the existing encrypted text-message request as a separate send operation.
         data = json.dumps(
-            {"sender": self.username, "recipient": self.recipient, "content": text}
+            {"recipient": self.recipient, "content": text}
         ).encode("utf-8")
         request = Request(
             f"{self.server_url}/messages",
@@ -607,11 +611,20 @@ class ChatWindow:
         except OSError:
             self.send_status.set("Could not read that file.")
             return
+        if file_size > MAXIMUM_FILE_BYTES:
+            self.send_status.set("Files cannot be larger than 2 GB.")
+            return
+        try:
+            checksum = self._file_checksum(path)
+        except OSError:
+            self.send_status.set("Could not verify that file.")
+            return
         self.attachment = {
             "path": path,
             # basename retains the original extension, e.g. "report.pdf".
             "filename": os.path.basename(path),
             "size": file_size,
+            "checksum": checksum,
         }
         self.attachment_progress.set(0)
         self.attachment_status.set(
@@ -625,10 +638,10 @@ class ChatWindow:
         attachment = self.attachment
         try:
             body = MultipartFileBody(
-                self.username,
                 self.recipient,
                 attachment["filename"],
                 attachment["path"],
+                attachment["checksum"],
                 self._update_attachment_progress,
             )
         except OSError:
@@ -646,7 +659,7 @@ class ChatWindow:
                     "Content-Length": str(body.content_length),
                 },
             )
-            with open_server(request, timeout=30) as response:
+            with open_server(request, timeout=FILE_TRANSFER_TIMEOUT_SECONDS) as response:
                 response_body = json.loads(response.read().decode("utf-8"))
         except HTTPError as error:
             try:
@@ -663,6 +676,9 @@ class ChatWindow:
             self._set_send_controls(True)
         if not response_body.get("success"):
             self.send_status.set(response_body.get("message", "The file could not be uploaded."))
+            return False
+        if response_body.get("checksum") != attachment["checksum"]:
+            self.send_status.set("The server did not confirm the file checksum.")
             return False
         self._clear_attachment()
         return True
@@ -689,25 +705,50 @@ class ChatWindow:
 
     @staticmethod
     def _file_size_label(size):
+        if size >= 1024 * 1024 * 1024:
+            return f"{size / (1024 * 1024 * 1024):.1f} GB"
         if size < 1024 * 1024:
             return f"{size / 1024:.1f} KB"
         return f"{size / (1024 * 1024):.1f} MB"
+
+    @staticmethod
+    def _file_checksum(path):
+        digest = hashlib.sha256()
+        with open(path, "rb") as source:
+            while chunk := source.read(1024 * 1024):
+                digest.update(chunk)
+        return digest.hexdigest()
 
     def _download_file(self, file_id, filename):
         # The server returns decrypted bytes only after checking this user is a participant.
         target = filedialog.asksaveasfilename(parent=self.root, initialfile=filename)
         if not target:
             return
-        parameters = urlencode({"username": self.username})
-        request = Request(f"{self.server_url}/files/{quote(file_id)}?{parameters}")
+        request = Request(f"{self.server_url}/files/{quote(file_id)}")
+        temporary_path = None
         try:
-            with open_server(request, timeout=30) as response:
-                contents = response.read()
-            with open(target, "wb") as downloaded_file:
-                downloaded_file.write(contents)
+            with open_server(request, timeout=FILE_TRANSFER_TIMEOUT_SECONDS) as response:
+                checksum = response.headers.get("X-Content-SHA256", "").lower()
+                if len(checksum) != 64 or any(character not in "0123456789abcdef" for character in checksum):
+                    raise OSError("The server did not provide a valid file checksum.")
+                descriptor, temporary_path = tempfile.mkstemp(
+                    prefix=".bluebubbles-download-", suffix=".tmp", dir=Path(target).parent
+                )
+                digest = hashlib.sha256()
+                with os.fdopen(descriptor, "wb") as downloaded_file:
+                    while chunk := response.read(1024 * 1024):
+                        digest.update(chunk)
+                        downloaded_file.write(chunk)
+                if digest.hexdigest() != checksum:
+                    raise OSError("Downloaded file checksum does not match.")
+            os.replace(temporary_path, target)
+            temporary_path = None
         except (OSError, HTTPError, URLError, TimeoutError):
-            self.send_status.set("Could not download that file.")
+            self.send_status.set("The file could not be downloaded or verified.")
             return
+        finally:
+            if temporary_path:
+                Path(temporary_path).unlink(missing_ok=True)
         self.send_status.set("")
 
     def _send_from_enter(self, event):

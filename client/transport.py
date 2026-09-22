@@ -3,13 +3,15 @@
 import os
 import socket
 import ssl
+from http.cookiejar import CookieJar
 from pathlib import Path
 from urllib.parse import urlsplit
-from urllib.request import urlopen
+from urllib.request import HTTPCookieProcessor, HTTPSHandler, build_opener
 
 
 DEFAULT_SERVER_URL = "https://192.168.0.150:5000"
 _BUNDLED_CA_FILE = Path(__file__).with_name("certificates") / "bluebubbles-lan-root-ca.pem"
+_SESSION_COOKIES = CookieJar()
 
 
 class TransportSecurityError(ValueError):
@@ -48,8 +50,11 @@ def ssl_context():
 
 
 def open_server(request, timeout=5):
-    # Open a request using the app's verified TLS context.
-    return urlopen(request, timeout=timeout, context=ssl_context())
+    # Keep the HTTPS-only, HttpOnly server session for this client process.
+    opener = build_opener(
+        HTTPCookieProcessor(_SESSION_COOKIES), HTTPSHandler(context=ssl_context())
+    )
+    return opener.open(request, timeout=timeout)
 
 
 def connection_error_message(error):

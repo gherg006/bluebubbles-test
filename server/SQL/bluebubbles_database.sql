@@ -34,7 +34,11 @@ CREATE TABLE IF NOT EXISTS messages (
     encryption_version INTEGER,
     encrypted_at TIMESTAMP,
     message_type TEXT NOT NULL DEFAULT 'text' CHECK (message_type IN ('text', 'file')),
-    attachment_uuid UUID
+    attachment_uuid UUID,
+    attachment_checksum CHAR(64) CHECK (
+        attachment_checksum IS NULL
+        OR attachment_checksum ~ '^[0-9a-f]{64}$'
+    )
 );
 
 CREATE TABLE IF NOT EXISTS chat_contacts (
@@ -50,6 +54,25 @@ CREATE INDEX IF NOT EXISTS encryption_keys_active_scope_lookup_idx
 
 CREATE INDEX IF NOT EXISTS messages_conversation_lookup_idx
     ON messages (sender_id, recipient_id, sent_at, message_id);
+
+-- Keep databases created before file uploads and integrity support compatible.
+ALTER TABLE messages
+    ADD COLUMN IF NOT EXISTS message_type TEXT NOT NULL DEFAULT 'text',
+    ADD COLUMN IF NOT EXISTS attachment_uuid UUID,
+    ADD COLUMN IF NOT EXISTS attachment_checksum CHAR(64);
+
+ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_message_type_check;
+ALTER TABLE messages
+    ADD CONSTRAINT messages_message_type_check
+    CHECK (message_type IN ('text', 'file'));
+
+ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_attachment_checksum_check;
+ALTER TABLE messages
+    ADD CONSTRAINT messages_attachment_checksum_check
+    CHECK (
+        attachment_checksum IS NULL
+        OR attachment_checksum ~ '^[0-9a-f]{64}$'
+    );
 
 CREATE UNIQUE INDEX IF NOT EXISTS messages_attachment_uuid_unique_idx
     ON messages (attachment_uuid) WHERE attachment_uuid IS NOT NULL;

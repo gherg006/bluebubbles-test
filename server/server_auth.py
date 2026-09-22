@@ -5,7 +5,8 @@ import os
 import subprocess
 from pathlib import Path
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, session
+from werkzeug.exceptions import RequestEntityTooLarge
 
 from message_system import MessageSystem
 from tls import tls_context
@@ -94,10 +95,10 @@ class ServerAuth:
         return result.returncode == 0
 
     def create_file_upload_schema(self):
-        # Apply the small additive migration for UUID-backed file messages.
-        migration = Path(__file__).with_name("SQL") / "002_add_file_uploads.sql"
+        # Reapply the idempotent main schema to bring existing databases up to date.
+        schema = Path(__file__).with_name("SQL") / "bluebubbles_database.sql"
         try:
-            query = migration.read_text(encoding="utf-8")
+            query = schema.read_text(encoding="utf-8")
         except OSError:
             return False
         return self._run_query(query, {}).returncode == 0
@@ -144,6 +145,15 @@ class ServerAuth:
 
 
 app = Flask(__name__)
+app.secret_key = os.getenv("BLUEBUBBLES_SESSION_SECRET")
+if not app.secret_key:
+    raise RuntimeError("BLUEBUBBLES_SESSION_SECRET must be configured.")
+app.config.update(
+    MAX_CONTENT_LENGTH=2 * 1024 * 1024 * 1024 + 1024 * 1024,
+    SESSION_COOKIE_SECURE=True,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Strict",
+)
 auth = ServerAuth()
 auth.create_contacts_table()
 if not auth.create_file_upload_schema():
@@ -157,6 +167,25 @@ def _credentials():
     return data.get("username", "").strip(), data.get("password", "")
 
 
+def _session_user():
+    # Identity is established only by the signed, HTTPS-only session cookie.
+    username = session.get("username")
+    return username if isinstance(username, str) and username else None
+
+
+def _require_session():
+    username = _session_user()
+    if username is None:
+        return None, (jsonify(success=False, message="Log in to continue."), 401)
+    return username, None
+
+
+@app.errorhandler(RequestEntityTooLarge)
+def file_too_large(_error):
+    # Keep the client API JSON-only when Werkzeug rejects an oversized request.
+    return jsonify(success=False, message="Files cannot be larger than 2 GB."), 413
+
+
 @app.post("/login")
 def login():
     # Handles login request from client
@@ -164,6 +193,8 @@ def login():
     if not username or not password:
         return jsonify(success=False, message="Enter a username and password."), 400
     if auth.login(username, password):
+        session.clear()
+        session["username"] = username
         return jsonify(success=True, message="Logged in.")
     return jsonify(success=False, message="Incorrect username or password."), 401
 
@@ -182,15 +213,18 @@ def register():
 @app.get("/users")
 def users():
     # Return the registered usernames used by the client users list.
+    _, failure = _require_session()
+    if failure:
+        return failure
     return jsonify(users=auth.users())
 
 
 @app.get("/contacts")
 def get_contacts():
     # Return the contacts that should remain in this account's sidebar.
-    username = request.args.get("username", "").strip()
-    if not username:
-        return jsonify(contacts=[]), 400
+    username, failure = _require_session()
+    if failure:
+        return failure
     return jsonify(contacts=auth.contacts(username))
 
 
@@ -198,9 +232,11 @@ def get_contacts():
 def add_contact():
     # Save an account to the caller's persistent sidebar.
     data = request.get_json(silent=True) or {}
-    username = data.get("username", "").strip()
+    username, failure = _require_session()
+    if failure:
+        return failure
     contact = data.get("contact", "").strip()
-    if not username or not contact or username == contact:
+    if not contact or username == contact:
         return jsonify(success=False, message="Choose another user to add."), 400
     if auth.add_contact(username, contact):
         return jsonify(success=True, message="Contact saved."), 201
@@ -211,9 +247,11 @@ def add_contact():
 def delete_contact():
     # Remove a saved sidebar contact only for the account that owns it.
     data = request.get_json(silent=True) or {}
-    username = data.get("username", "").strip()
+    username, failure = _require_session()
+    if failure:
+        return failure
     contact = data.get("contact", "").strip()
-    if not username or not contact or username == contact:
+    if not contact or username == contact:
         return jsonify(success=False, message="Choose a contact to delete."), 400
     if auth.delete_contact(username, contact):
         return jsonify(success=True, message="Contact deleted.")
@@ -223,9 +261,11 @@ def delete_contact():
 @app.get("/messages")
 def get_messages():
     # Return the selected conversation for the logged-in user.
-    username = request.args.get("username", "").strip()
+    username, failure = _require_session()
+    if failure:
+        return failure
     other_user = request.args.get("with", "").strip()
-    if not username or not other_user:
+    if not other_user:
         return jsonify(messages=[]), 400
     return jsonify(messages=messages.conversation(username, other_user))
 
@@ -234,7 +274,9 @@ def get_messages():
 def send_message():
     # Save one encrypted message for another registered account.
     data = request.get_json(silent=True) or {}
-    sender = data.get("sender", "").strip()
+    sender, failure = _require_session()
+    if failure:
+        return failure
     recipient = data.get("recipient", "").strip()
     content = data.get("content", "").strip()
     if not sender or not recipient or not content:
@@ -247,30 +289,35 @@ def send_message():
 @app.post("/files")
 def upload_file():
     # Store a multipart file as an encrypted message and encrypted UUID-addressed blob.
-    sender = request.form.get("sender", "").strip()
+    sender, failure = _require_session()
+    if failure:
+        return failure
     recipient = request.form.get("recipient", "").strip()
+    checksum = request.form.get("checksum", "").strip().lower()
     uploaded_file = request.files.get("file")
-    if not sender or not recipient or uploaded_file is None or not uploaded_file.filename:
+    if not recipient or uploaded_file is None or not uploaded_file.filename:
         return jsonify(success=False, message="Choose a recipient and file."), 400
-    contents = uploaded_file.read(messages.file_storage.max_file_bytes + 1)
-    if len(contents) > messages.file_storage.max_file_bytes:
-        return jsonify(success=False, message="The file is too large."), 413
-    file_id = messages.send_file(sender, recipient, uploaded_file.filename, contents)
+    file_id = messages.send_file_stream(
+        sender, recipient, uploaded_file.filename, uploaded_file.stream, checksum
+    )
     if not file_id:
-        return jsonify(success=False, message="The file could not be uploaded."), 400
-    return jsonify(success=True, file_id=file_id, message="File uploaded."), 201
+        return jsonify(success=False, message="The file could not be uploaded or verified."), 400
+    return jsonify(success=True, file_id=file_id, checksum=checksum, message="File uploaded."), 201
 
 
 @app.get("/files/<file_id>")
 def download_file(file_id):
     # The message participants alone can retrieve and decrypt the UUID-addressed file.
-    username = request.args.get("username", "").strip()
-    if not username:
-        return jsonify(success=False, message="Enter a username."), 400
-    contents = messages.retrieve_file(username, file_id)
-    if contents is None:
+    username, failure = _require_session()
+    if failure:
+        return failure
+    download = messages.retrieve_file_stream(username, file_id)
+    if download is None:
         return jsonify(success=False, message="The file is unavailable."), 404
+    contents, length, checksum = download
     response = app.response_class(contents, mimetype="application/octet-stream")
+    response.content_length = length
+    response.headers["X-Content-SHA256"] = checksum
     response.headers["Cache-Control"] = "no-store"
     return response
 
