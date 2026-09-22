@@ -363,7 +363,7 @@ class MessageSystem:
             "SELECT sender.\"userID\", recipient.\"userID\", '', CURRENT_TIMESTAMP, "
             "decode(:'ciphertext', 'base64'), decode(:'nonce', 'base64'), "
             ":'encryption_key_id', 1, CURRENT_TIMESTAMP, :'message_type', "
-            "NULLIF(:'attachment_uuid', '')::uuid, NULLIF(:'attachment_checksum', '')) "
+            "NULLIF(:'attachment_uuid', '')::uuid, NULLIF(:'attachment_checksum', '') "
             "FROM users sender JOIN users recipient ON TRUE "
             "WHERE sender.username = :'sender' AND recipient.username = :'recipient' "
             "RETURNING message_id;",
