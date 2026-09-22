@@ -1,7 +1,8 @@
 import json
+import os
 import tkinter as tk
 import uuid
-from tkinter import filedialog
+from tkinter import filedialog, ttk
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request
@@ -18,6 +19,67 @@ WHITE = "#ffffff"
 REFRESH_INTERVAL_MS = 1000
 
 
+class MultipartFileBody:
+    # Stream one attachment so progress can advance while urllib sends it.
+    _chunk_size = 64 * 1024
+
+    def __init__(self, sender, recipient, filename, path, progress_callback):
+        boundary = f"----BlueBubbles{uuid.uuid4().hex}"
+        self.content_type = f"multipart/form-data; boundary={boundary}"
+        self._prefix = self._headers(boundary, sender, recipient, filename)
+        self._suffix = f"\r\n--{boundary}--\r\n".encode("ascii")
+        self._file = open(path, "rb")
+        self._file_size = os.path.getsize(path)
+        self.content_length = len(self._prefix) + self._file_size + len(self._suffix)
+        self._progress_callback = progress_callback
+        self._sent_file_bytes = 0
+
+    @staticmethod
+    def _headers(boundary, sender, recipient, filename):
+        encoded = bytearray()
+        for name, value in (("sender", sender), ("recipient", recipient)):
+            encoded.extend(f"--{boundary}\r\n".encode("ascii"))
+            encoded.extend(
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode("utf-8")
+            )
+        encoded.extend(f"--{boundary}\r\n".encode("ascii"))
+        encoded.extend(
+            f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'.encode("utf-8")
+        )
+        encoded.extend(b"Content-Type: application/octet-stream\r\n\r\n")
+        return bytes(encoded)
+
+    def read(self, size=-1):
+        # HTTPConnection requests bounded reads; return only the next portion of the body.
+        if size is None or size < 0:
+            size = self._chunk_size
+        parts = []
+        remaining = size
+        while remaining:
+            if self._prefix:
+                part, self._prefix = self._prefix[:remaining], self._prefix[remaining:]
+            elif self._file is not None:
+                part = self._file.read(min(remaining, self._chunk_size))
+                if not part:
+                    self._file.close()
+                    self._file = None
+                    continue
+                self._sent_file_bytes += len(part)
+                self._progress_callback(self._sent_file_bytes, self._file_size)
+            elif self._suffix:
+                part, self._suffix = self._suffix[:remaining], self._suffix[remaining:]
+            else:
+                break
+            parts.append(part)
+            remaining -= len(part)
+        return b"".join(parts)
+
+    def close(self):
+        if self._file is not None:
+            self._file.close()
+            self._file = None
+
+
 class ChatWindow:
     # Show the main sharp-edged chat screen after login.
     def __init__(self, root, username, server_url):
@@ -32,6 +94,7 @@ class ChatWindow:
         self.chat_title = tk.StringVar(value="Chat user")
         self.recipient = None
         self.current_messages = None
+        self.attachment = None
 
         root.title("BlueBubbles")
         root.geometry("1080x650")
@@ -123,7 +186,7 @@ class ChatWindow:
         self.message_entry.grid(row=0, column=0, sticky="ew", ipady=8)
         self.message_entry.bind("<Return>", self._send_from_enter)
         self.message_entry.bind("<KP_Enter>", self._send_from_enter)
-        tk.Button(
+        self.send_button = tk.Button(
             compose,
             text="Send",
             command=self.send_message,
@@ -133,26 +196,56 @@ class ChatWindow:
             bd=1,
             relief="solid",
             width=8,
-        ).grid(
+        )
+        self.send_button.grid(
             row=0, column=1, padx=(8, 0)
         )
-        tk.Button(
+        self.attach_button = tk.Button(
             compose,
-            text="Upload file",
-            command=self.upload_file,
+            text="Attach file",
+            command=self.attach_file,
             bg=BUTTON,
             fg=TEXT,
             font=("Arial", 10, "bold"),
             bd=1,
             relief="solid",
-        ).grid(row=0, column=2, padx=(8, 0))
+        )
+        self.attach_button.grid(row=0, column=2, padx=(8, 0))
+        self.attachment_status = tk.StringVar()
+        self.attachment_progress = tk.DoubleVar(value=0)
+        self.attachment_frame = tk.Frame(compose, bg=BACKGROUND)
+        self.attachment_frame.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(5, 0))
+        self.attachment_frame.grid_columnconfigure(1, weight=1)
+        tk.Label(
+            self.attachment_frame,
+            textvariable=self.attachment_status,
+            bg=BACKGROUND,
+            fg=TEXT,
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Progressbar(
+            self.attachment_frame,
+            maximum=100,
+            variable=self.attachment_progress,
+            mode="determinate",
+        ).grid(row=0, column=1, sticky="ew")
+        self.remove_attachment_button = tk.Button(
+            self.attachment_frame,
+            text="Remove",
+            command=self._clear_attachment,
+            bg="#f5aaa4",
+            relief="solid",
+            bd=1,
+        )
+        self.remove_attachment_button.grid(row=0, column=2, padx=(8, 0))
+        self.attachment_frame.grid_remove()
         tk.Label(
             compose,
             textvariable=self.send_status,
             bg=BACKGROUND,
             fg="#9a2d27",
             anchor="w",
-        ).grid(row=1, column=0, columnspan=3, sticky="ew", pady=(5, 0))
+        ).grid(row=2, column=0, columnspan=3, sticky="ew", pady=(5, 0))
 
     def _build_users(self, parent):
         # Display only the accounts the user has chosen to message.
@@ -454,15 +547,26 @@ class ChatWindow:
             tk.Label(block, text=text, bg=WHITE, fg="#526b7e", font=("Arial", 10), justify="left", wraplength=430).pack(anchor="w", pady=(3, 0))
 
     def send_message(self):
-        # Save the new plain-text message and refresh the conversation.
+        # Send an attached file only when the user explicitly presses Send.
         text = self.message_text.get().strip()
         if not self.recipient:
             self.send_status.set("Choose a user before sending a message.")
             return
-        if not text:
-            self.send_status.set("Write a message before sending.")
+        if not text and self.attachment is None:
+            self.send_status.set("Write a message or attach a file before sending.")
             self.message_entry.focus_set()
             return
+        if self.attachment is not None and not self._send_attached_file():
+            return
+        if text and not self._send_text_message(text):
+            return
+        if text:
+            self.message_text.set("")
+        self.send_status.set("")
+        self._refresh_conversation(scroll_to_latest=True)
+
+    def _send_text_message(self, text):
+        # Keep the existing encrypted text-message request as a separate send operation.
         data = json.dumps(
             {"sender": self.username, "recipient": self.recipient, "content": text}
         ).encode("utf-8")
@@ -480,76 +584,114 @@ class ChatWindow:
                 self.send_status.set(body.get("message", "Message could not be sent."))
             except json.JSONDecodeError:
                 self.send_status.set("Message could not be sent.")
-            return
+            return False
         except (URLError, TimeoutError, json.JSONDecodeError):
             self.send_status.set("Could not reach the server. Try again.")
-            return
+            return False
 
         if not body.get("success"):
             self.send_status.set(body.get("message", "Message could not be sent."))
-            return
-        self.message_text.set("")
-        self.send_status.set("")
-        self._refresh_conversation(scroll_to_latest=True)
+            return False
+        return True
 
-    def upload_file(self):
-        # Keep the selected filename in encrypted message metadata; the blob uses a server UUID.
+    def attach_file(self):
+        # Select locally now; no file leaves the client until Send is pressed.
         if not self.recipient:
-            self.send_status.set("Choose a user before uploading a file.")
+            self.send_status.set("Choose a user before attaching a file.")
             return
         path = filedialog.askopenfilename(parent=self.root)
         if not path:
             return
         try:
-            with open(path, "rb") as selected_file:
-                contents = selected_file.read()
-            filename = path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
-            data, content_type = self._multipart_file_request(
-                self.username, self.recipient, filename, contents
-            )
+            file_size = os.path.getsize(path)
         except OSError:
             self.send_status.set("Could not read that file.")
             return
-        request = Request(
-            f"{self.server_url}/files", data=data, headers={"Content-Type": content_type}
+        self.attachment = {
+            "path": path,
+            # basename retains the original extension, e.g. "report.pdf".
+            "filename": os.path.basename(path),
+            "size": file_size,
+        }
+        self.attachment_progress.set(0)
+        self.attachment_status.set(
+            f"Attached: {self.attachment['filename']} ({self._file_size_label(file_size)}) — press Send"
         )
+        self.attachment_frame.grid()
+        self.send_status.set("")
+
+    def _send_attached_file(self):
+        # Stream the selected file and update the bar as bytes leave the client.
+        attachment = self.attachment
         try:
+            body = MultipartFileBody(
+                self.username,
+                self.recipient,
+                attachment["filename"],
+                attachment["path"],
+                self._update_attachment_progress,
+            )
+        except OSError:
+            self.send_status.set("Could not read the attached file. Attach it again.")
+            return False
+        self._set_send_controls(False)
+        self.attachment_progress.set(0)
+        self.attachment_status.set(f"Uploading: {attachment['filename']} (0%)")
+        try:
+            request = Request(
+                f"{self.server_url}/files",
+                data=body,
+                headers={
+                    "Content-Type": body.content_type,
+                    "Content-Length": str(body.content_length),
+                },
+            )
             with open_server(request, timeout=30) as response:
-                body = json.loads(response.read().decode("utf-8"))
+                response_body = json.loads(response.read().decode("utf-8"))
         except HTTPError as error:
             try:
-                body = json.loads(error.read().decode("utf-8"))
-                self.send_status.set(body.get("message", "The file could not be uploaded."))
+                response_body = json.loads(error.read().decode("utf-8"))
+                self.send_status.set(response_body.get("message", "The file could not be uploaded."))
             except json.JSONDecodeError:
                 self.send_status.set("The file could not be uploaded.")
-            return
+            return False
         except (URLError, TimeoutError, json.JSONDecodeError):
             self.send_status.set("Could not reach the server. Try again.")
-            return
-        if not body.get("success"):
-            self.send_status.set(body.get("message", "The file could not be uploaded."))
-            return
-        self.send_status.set("")
-        self._refresh_conversation(scroll_to_latest=True)
+            return False
+        finally:
+            body.close()
+            self._set_send_controls(True)
+        if not response_body.get("success"):
+            self.send_status.set(response_body.get("message", "The file could not be uploaded."))
+            return False
+        self._clear_attachment()
+        return True
+
+    def _update_attachment_progress(self, sent_bytes, total_bytes):
+        percentage = 100 if not total_bytes else sent_bytes * 100 / total_bytes
+        self.attachment_progress.set(percentage)
+        self.attachment_status.set(
+            f"Uploading: {self.attachment['filename']} ({percentage:.0f}%)"
+        )
+        self.root.update_idletasks()
+
+    def _clear_attachment(self):
+        self.attachment = None
+        self.attachment_progress.set(0)
+        self.attachment_status.set("")
+        self.attachment_frame.grid_remove()
+
+    def _set_send_controls(self, enabled):
+        state = "normal" if enabled else "disabled"
+        self.send_button.configure(state=state)
+        self.attach_button.configure(state=state)
+        self.remove_attachment_button.configure(state=state)
 
     @staticmethod
-    def _multipart_file_request(sender, recipient, filename, contents):
-        # Build a stdlib-only multipart body without putting file content in JSON or logs.
-        boundary = f"----BlueBubbles{uuid.uuid4().hex}"
-        encoded = bytearray()
-        for name, value in (("sender", sender), ("recipient", recipient)):
-            encoded.extend(f"--{boundary}\r\n".encode("ascii"))
-            encoded.extend(
-                f'Content-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode("utf-8")
-            )
-        encoded.extend(f"--{boundary}\r\n".encode("ascii"))
-        encoded.extend(
-            f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'.encode("utf-8")
-        )
-        encoded.extend(b"Content-Type: application/octet-stream\r\n\r\n")
-        encoded.extend(contents)
-        encoded.extend(f"\r\n--{boundary}--\r\n".encode("ascii"))
-        return bytes(encoded), f"multipart/form-data; boundary={boundary}"
+    def _file_size_label(size):
+        if size < 1024 * 1024:
+            return f"{size / 1024:.1f} KB"
+        return f"{size / (1024 * 1024):.1f} MB"
 
     def _download_file(self, file_id, filename):
         # The server returns decrypted bytes only after checking this user is a participant.
