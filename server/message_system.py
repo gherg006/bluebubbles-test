@@ -17,6 +17,7 @@ DEFAULT_UPLOAD_DIRECTORY = Path(__file__).with_name("uploads")
 MAXIMUM_FILE_BYTES = 2 * 1024 * 1024 * 1024
 DEFAULT_MAX_FILE_BYTES = MAXIMUM_FILE_BYTES
 FILE_CHUNK_BYTES = 1024 * 1024
+MESSAGE_PAGE_SIZE = 100
 
 
 class FileStorageError(RuntimeError):
@@ -215,16 +216,16 @@ class MessageKeyStore:
         scope_id = str(
             uuid.uuid5(uuid.NAMESPACE_URL, f"bluebubbles:message-recipient:{recipient}")
         )
-        result = self.run_query(
+        active_key_query = (
             "SELECT encryption_keys.id, "
             "replace(encode(encryption_keys.wrapped_key, 'base64'), E'\\n', '') "
             "FROM encryption_keys "
             "WHERE encryption_keys.scope_type = 'user' "
             "AND encryption_keys.scope_id = :'scope_id' "
             "AND encryption_keys.status = 'active' "
-            "ORDER BY encryption_keys.key_version DESC, encryption_keys.id DESC LIMIT 1;",
-            {"recipient": recipient, "scope_id": scope_id},
+            "ORDER BY encryption_keys.key_version DESC, encryption_keys.id DESC LIMIT 1;"
         )
+        result = self.run_query(active_key_query, {"scope_id": scope_id})
         if result.returncode != 0:
             return None
         if result.stdout.strip():
@@ -241,6 +242,7 @@ class MessageKeyStore:
             "SELECT 'user', :'scope_id', decode(:'wrapped_key', 'base64'), "
             "1, 'active', CURRENT_TIMESTAMP, NULL "
             "FROM users recipient WHERE recipient.username = :'recipient' "
+            "ON CONFLICT (scope_type, scope_id, key_version) DO NOTHING "
             "RETURNING id;",
             {
                 "recipient": recipient,
@@ -248,9 +250,20 @@ class MessageKeyStore:
                 "wrapped_key": wrapped_key,
             },
         )
+        if result.returncode != 0:
+            return None
+        if result.stdout.strip():
+            return result.stdout.strip(), data_key
+
+        # Another request inserted this recipient's first key while we were
+        # creating ours. Use the committed key so both messages can be sent.
+        result = self.run_query(active_key_query, {"scope_id": scope_id})
         if result.returncode != 0 or not result.stdout.strip():
             return None
-        return result.stdout.strip(), data_key
+        key_id, wrapped_key = result.stdout.strip().split("|", 1)
+        return key_id, self.encryptor.unwrap_data_key(
+            base64.b64decode(wrapped_key, validate=True)
+        )
 
     def unwrap(self, wrapped_key):
         # Decode database-safe base64 only immediately before AES-GCM key unwrapping.
@@ -277,9 +290,12 @@ class MessageSystem:
             ciphertext, nonce = self.encryptor.encrypt_message(content, data_key)
         except Exception:
             return False
-        return self._insert_encrypted(
+        saved = self._insert_encrypted(
             sender, recipient, ciphertext, nonce, encryption_key_id, "text", None
         )
+        if not saved:
+            return False
+        return {**saved, "sender": sender, "content": content}
 
     def send_file(self, sender, recipient, filename, contents):
         # Keep the original filename only in the encrypted message metadata.
@@ -348,7 +364,10 @@ class MessageSystem:
         if not saved:
             self.file_storage.delete(file_id)
             return False
-        return str(file_id)
+        return {
+            **saved, "sender": sender, "content": "", "type": "file",
+            "file_id": str(file_id), "filename": filename, "checksum": checksum,
+        }
 
     def _insert_encrypted(
         self, sender, recipient, ciphertext, nonce, encryption_key_id, message_type, attachment_uuid,
@@ -366,7 +385,8 @@ class MessageSystem:
             "NULLIF(:'attachment_uuid', '')::uuid, NULLIF(:'attachment_checksum', '') "
             "FROM users sender JOIN users recipient ON TRUE "
             "WHERE sender.username = :'sender' AND recipient.username = :'recipient' "
-            "RETURNING message_id;",
+            "RETURNING message_id, to_char(sent_at, 'DD/MM/YYYY'), "
+            "to_char(sent_at, 'HH24:MI');",
             {
                 "sender": sender,
                 "recipient": recipient,
@@ -378,12 +398,24 @@ class MessageSystem:
                 "attachment_checksum": attachment_checksum or "",
             },
         )
-        return result.returncode == 0 and bool(result.stdout.strip())
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        message_id, sent_date, sent_time = result.stdout.strip().split("|", 2)
+        return {"id": int(message_id), "date": sent_date, "time": sent_time}
 
-    def conversation(self, username, other_user):
-        # Load legacy base64 text or encrypted fields without sending sensitive values to logs.
+    def conversation(self, username, other_user, before_id=None, after_id=None):
+        # Load only one bounded page, newest first for history and oldest first for updates.
+        cursor_clause = ""
+        values = {"username": username, "other_user": other_user}
+        if before_id is not None:
+            cursor_clause = "AND messages.message_id < :'cursor'::bigint "
+            values["cursor"] = before_id
+        elif after_id is not None:
+            cursor_clause = "AND messages.message_id > :'cursor'::bigint "
+            values["cursor"] = after_id
+        direction = "ASC" if after_id is not None else "DESC"
         result = self.run_query(
-            "SELECT sender.username, "
+            "SELECT messages.message_id, sender.username, "
             "CASE WHEN messages.encryption_key_id IS NULL "
             "THEN replace(encode(convert_to(messages.message_content, 'UTF8'), 'base64'), E'\\n', '') END, "
             "to_char(messages.sent_at, 'DD/MM/YYYY'), "
@@ -397,10 +429,11 @@ class MessageSystem:
             "JOIN users sender ON sender.\"userID\" = messages.sender_id "
             "JOIN users recipient ON recipient.\"userID\" = messages.recipient_id "
             "LEFT JOIN encryption_keys ON encryption_keys.id = messages.encryption_key_id "
-            "WHERE (sender.username = :'username' AND recipient.username = :'other_user') "
-            "OR (sender.username = :'other_user' AND recipient.username = :'username') "
-            "ORDER BY messages.sent_at, messages.message_id;",
-            {"username": username, "other_user": other_user},
+            "WHERE ((sender.username = :'username' AND recipient.username = :'other_user') "
+            "OR (sender.username = :'other_user' AND recipient.username = :'username')) "
+            + cursor_clause +
+            f"ORDER BY messages.message_id {direction} LIMIT {MESSAGE_PAGE_SIZE + 1};",
+            values,
         )
         if result.returncode != 0:
             return []
@@ -408,6 +441,7 @@ class MessageSystem:
         messages = []
         for row in result.stdout.splitlines():
             (
+                message_id,
                 sender,
                 legacy_content,
                 sent_date,
@@ -418,11 +452,14 @@ class MessageSystem:
                 wrapped_key,
                 message_type,
                 attachment_checksum,
-            ) = row.split("|", 9)
+            ) = row.split("|", 10)
             content = self._message_content(
                 legacy_content, encryption_key_id, ciphertext, nonce, wrapped_key
             )
-            message = {"sender": sender, "content": content, "date": sent_date, "time": sent_time}
+            message = {
+                "id": int(message_id), "sender": sender, "content": content,
+                "date": sent_date, "time": sent_time,
+            }
             if message_type == "file":
                 try:
                     metadata = json.loads(content)
@@ -434,6 +471,8 @@ class MessageSystem:
                 except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                     message["content"] = "[Encrypted file unavailable]"
             messages.append(message)
+        if direction == "DESC":
+            messages.reverse()
         return messages
 
     def retrieve_file(self, username, file_id):

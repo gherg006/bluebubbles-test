@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS chat_contacts (
     "userID" INTEGER NOT NULL REFERENCES users("userID") ON DELETE CASCADE,
     contact_id INTEGER NOT NULL REFERENCES users("userID") ON DELETE CASCADE,
     added_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_read_message_id BIGINT NOT NULL DEFAULT 0,
     PRIMARY KEY ("userID", contact_id),
     CHECK ("userID" <> contact_id)
 );

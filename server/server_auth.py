@@ -1,19 +1,19 @@
 # HTTP server handling authentication
 
 import hashlib
+import json
 import os
 import subprocess
-from pathlib import Path
 
 from flask import Flask, jsonify, request, session
 from werkzeug.exceptions import RequestEntityTooLarge
 
-from message_system import MessageSystem
+from message_system import MESSAGE_PAGE_SIZE, MessageSystem
 from tls import tls_context
 
 
 class ServerAuth:
-    # Checks and creates postgres table
+    # Authentication and contact queries for the web API.
 
     def __init__(self):
         self.database = os.getenv("BLUEBUBBLES_DB_NAME", "Bluebubbles_app")
@@ -81,41 +81,78 @@ class ServerAuth:
         return [name for name in result.stdout.splitlines() if name]
 
     def create_contacts_table(self):
-        # Create the per-user contact list used to restore chat sidebars.
+        # Keep saved contacts and their read positions across client restarts.
         result = self._run_query(
+            "BEGIN; "
             "CREATE TABLE IF NOT EXISTS chat_contacts ("
             "\"userID\" INTEGER NOT NULL REFERENCES users(\"userID\") ON DELETE CASCADE, "
             "contact_id INTEGER NOT NULL REFERENCES users(\"userID\") ON DELETE CASCADE, "
             "added_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+            "last_read_message_id BIGINT NOT NULL DEFAULT 0, "
             "PRIMARY KEY (\"userID\", contact_id), "
             "CHECK (\"userID\" <> contact_id)"
-            ");",
+            "); "
+            "ALTER TABLE chat_contacts ADD COLUMN IF NOT EXISTS last_read_message_id BIGINT; "
+            "UPDATE chat_contacts saved SET last_read_message_id = COALESCE(("
+            "SELECT MAX(message_id) FROM messages "
+            "WHERE sender_id = saved.contact_id AND recipient_id = saved.\"userID\""
+            "), 0) WHERE saved.last_read_message_id IS NULL; "
+            "ALTER TABLE chat_contacts ALTER COLUMN last_read_message_id SET DEFAULT 0; "
+            "ALTER TABLE chat_contacts ALTER COLUMN last_read_message_id SET NOT NULL; "
+            "COMMIT;",
             {},
         )
         return result.returncode == 0
 
-    def create_file_upload_schema(self):
-        # Reapply the idempotent main schema to bring existing databases up to date.
-        schema = Path(__file__).with_name("SQL") / "bluebubbles_database.sql"
-        try:
-            query = schema.read_text(encoding="utf-8")
-        except OSError:
-            return False
-        return self._run_query(query, {}).returncode == 0
-
     def contacts(self, username):
-        # Return one account's saved sidebar contacts in the order they were added.
+        # One indexed conversation scan per saved contact provides the sort metrics.
         result = self._run_query(
-            "SELECT contact.username FROM chat_contacts saved "
+            "SELECT COALESCE(json_agg(json_build_object("
+            "'name', contact.username, "
+            "'added_at', (EXTRACT(EPOCH FROM saved.added_at) * 1000000)::bigint, "
+            "'latest_message_id', COALESCE(activity.latest_message_id, 0), "
+            "'message_count', COALESCE(activity.message_count, 0), "
+            "'unread_count', COALESCE(activity.unread_count, 0)"
+            ") ORDER BY saved.added_at, contact.username), '[]'::json) "
+            "FROM chat_contacts saved "
             "JOIN users owner ON owner.\"userID\" = saved.\"userID\" "
             "JOIN users contact ON contact.\"userID\" = saved.contact_id "
-            "WHERE owner.username = :'username' "
-            "ORDER BY saved.added_at, contact.username;",
+            "LEFT JOIN LATERAL ("
+            "SELECT MAX(message_id) AS latest_message_id, "
+            "COUNT(*) AS message_count, "
+            "COUNT(*) FILTER (WHERE sender_id = saved.contact_id "
+            "AND recipient_id = saved.\"userID\" "
+            "AND message_id > saved.last_read_message_id) AS unread_count "
+            "FROM messages WHERE "
+            "(sender_id = saved.\"userID\" AND recipient_id = saved.contact_id) "
+            "OR (sender_id = saved.contact_id AND recipient_id = saved.\"userID\")"
+            ") activity ON TRUE "
+            "WHERE owner.username = :'username';",
             {"username": username},
         )
         if result.returncode != 0:
             return []
-        return [name for name in result.stdout.splitlines() if name]
+        try:
+            return json.loads(result.stdout.strip())
+        except json.JSONDecodeError:
+            return []
+
+    def mark_contact_read(self, username, contact, through_id):
+        # A read position only moves forward and never past this conversation.
+        result = self._run_query(
+            "UPDATE chat_contacts saved SET last_read_message_id = "
+            "GREATEST(saved.last_read_message_id, LEAST(:'through_id'::bigint, "
+            "COALESCE((SELECT MAX(message_id) FROM messages "
+            "WHERE (sender_id = saved.\"userID\" AND recipient_id = saved.contact_id) "
+            "OR (sender_id = saved.contact_id AND recipient_id = saved.\"userID\")), 0))) "
+            "FROM users owner, users contact "
+            "WHERE saved.\"userID\" = owner.\"userID\" "
+            "AND saved.contact_id = contact.\"userID\" "
+            "AND owner.username = :'username' AND contact.username = :'contact' "
+            "RETURNING saved.last_read_message_id;",
+            {"username": username, "contact": contact, "through_id": through_id},
+        )
+        return result.returncode == 0 and bool(result.stdout.strip())
 
     def add_contact(self, username, contact):
         # Save a sidebar contact once, provided both accounts exist.
@@ -155,9 +192,8 @@ app.config.update(
     SESSION_COOKIE_SAMESITE="Strict",
 )
 auth = ServerAuth()
-auth.create_contacts_table()
-if not auth.create_file_upload_schema():
-    raise RuntimeError("The file upload database migration could not be applied.")
+if not auth.create_contacts_table():
+    raise RuntimeError("The contacts database migration could not be applied.")
 messages = MessageSystem(auth._run_query)
 
 
@@ -225,7 +261,26 @@ def get_contacts():
     username, failure = _require_session()
     if failure:
         return failure
-    return jsonify(contacts=auth.contacts(username))
+    details = auth.contacts(username)
+    return jsonify(contacts=[item["name"] for item in details], contact_details=details)
+
+
+@app.post("/contacts/read")
+def mark_contact_read():
+    # Record the newest message this user has actually opened in a saved chat.
+    username, failure = _require_session()
+    if failure:
+        return failure
+    data = request.get_json(silent=True) or {}
+    contact = data.get("contact", "")
+    through_id = data.get("through_id")
+    if (not isinstance(contact, str) or not contact.strip()
+            or isinstance(through_id, bool) or not isinstance(through_id, int)
+            or not 0 < through_id < 2**63):
+        return jsonify(success=False, message="Invalid read position."), 400
+    if auth.mark_contact_read(username, contact.strip(), through_id):
+        return jsonify(success=True)
+    return jsonify(success=False, message="The contact could not be marked read."), 404
 
 
 @app.post("/contacts")
@@ -267,7 +322,21 @@ def get_messages():
     other_user = request.args.get("with", "").strip()
     if not other_user:
         return jsonify(messages=[]), 400
-    return jsonify(messages=messages.conversation(username, other_user))
+    before_value = request.args.get("before_id")
+    after_value = request.args.get("after_id")
+    if before_value is not None and after_value is not None:
+        return jsonify(success=False, message="Choose one message cursor."), 400
+    try:
+        before_id = int(before_value) if before_value is not None else None
+        after_id = int(after_value) if after_value is not None else None
+    except ValueError:
+        return jsonify(success=False, message="Invalid message cursor."), 400
+    if any(value is not None and not 0 < value < 2**63 for value in (before_id, after_id)):
+        return jsonify(success=False, message="Invalid message cursor."), 400
+    page = messages.conversation(username, other_user, before_id=before_id, after_id=after_id)
+    has_more = len(page) > MESSAGE_PAGE_SIZE
+    page = page[:MESSAGE_PAGE_SIZE] if after_id is not None else page[-MESSAGE_PAGE_SIZE:]
+    return jsonify(messages=page, has_more=has_more)
 
 
 @app.post("/messages")
@@ -281,8 +350,9 @@ def send_message():
     content = data.get("content", "").strip()
     if not sender or not recipient or not content:
         return jsonify(success=False, message="Enter a recipient and message."), 400
-    if messages.send(sender, recipient, content):
-        return jsonify(success=True, message="Message sent."), 201
+    saved = messages.send(sender, recipient, content)
+    if saved:
+        return jsonify(success=True, message="Message sent.", saved_message=saved), 201
     return jsonify(success=False, message="The message could not be sent."), 400
 
 
@@ -297,12 +367,15 @@ def upload_file():
     uploaded_file = request.files.get("file")
     if not recipient or uploaded_file is None or not uploaded_file.filename:
         return jsonify(success=False, message="Choose a recipient and file."), 400
-    file_id = messages.send_file_stream(
+    saved = messages.send_file_stream(
         sender, recipient, uploaded_file.filename, uploaded_file.stream, checksum
     )
-    if not file_id:
+    if not saved:
         return jsonify(success=False, message="The file could not be uploaded or verified."), 400
-    return jsonify(success=True, file_id=file_id, checksum=checksum, message="File uploaded."), 201
+    return jsonify(
+        success=True, file_id=saved["file_id"], checksum=checksum,
+        saved_message=saved, message="File uploaded.",
+    ), 201
 
 
 @app.get("/files/<file_id>")

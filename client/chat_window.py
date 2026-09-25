@@ -1,8 +1,11 @@
 import json
 import hashlib
 import os
+import queue
 import tempfile
+import threading
 import tkinter as tk
+import time
 import uuid
 from pathlib import Path
 from tkinter import filedialog, ttk
@@ -20,6 +23,10 @@ BUTTON = "#a8d4ed"
 TEXT = "#1f3449"
 WHITE = "#ffffff"
 REFRESH_INTERVAL_MS = 1000
+CONTACT_SORT_REFRESH_MS = 10000
+UI_RESULT_INTERVAL_MS = 50
+MESSAGE_PAGE_SIZE = 100
+MESSAGE_BUBBLE_WIDTH = 390
 MAXIMUM_FILE_BYTES = 2 * 1024 * 1024 * 1024
 FILE_TRANSFER_TIMEOUT_SECONDS = 60 * 60
 
@@ -93,6 +100,13 @@ class ChatWindow:
         self.server_url = server_url
         self.users = []
         self.contacts = []
+        self.contact_details = {}
+        self._displayed_contacts = []
+        self._context_contact = None
+        self._sort_mode = "saved"
+        self._contacts_request = None
+        self._contacts_refresh_pending = False
+        self._read_sent = {}
         self.message_text = tk.StringVar()
         self.send_status = tk.StringVar()
         self.search_text = tk.StringVar(value="Search")
@@ -100,6 +114,16 @@ class ChatWindow:
         self.recipient = None
         self.current_messages = None
         self.attachment = None
+        self._has_older = False
+        self._has_newer = False
+        self._conversation_generation = 0
+        self._history_request = None
+        self._poll_request = None
+        self._send_in_flight = False
+        self._attachment_check = None
+        self._download_in_flight = False
+        self._contact_delete_in_flight = False
+        self._ui_results = queue.Queue()
 
         root.title("BlueBubbles")
         root.geometry("1080x650")
@@ -108,7 +132,9 @@ class ChatWindow:
         self._build_window()
         self._load_users()
         self._load_contacts()
+        self.root.after(UI_RESULT_INTERVAL_MS, self._drain_background)
         self._schedule_message_refresh()
+        self.root.after(CONTACT_SORT_REFRESH_MS, self._refresh_contact_sort)
 
     def _build_window(self):
         # Keep the app box and separate sort box in the same arrangement as the image.
@@ -168,7 +194,7 @@ class ChatWindow:
         scrollbar = tk.Scrollbar(
             message_area,
             orient="vertical",
-            command=self.message_canvas.yview,
+            command=self._scrollbar_scroll,
         )
         scrollbar.grid(row=0, column=1, sticky="ns")
         self.message_canvas.configure(yscrollcommand=scrollbar.set)
@@ -176,7 +202,6 @@ class ChatWindow:
         self.message_window = self.message_canvas.create_window(
             (0, 0), window=self.messages, anchor="nw"
         )
-        self.messages.grid_columnconfigure(0, weight=1)
         self.messages.bind("<Configure>", self._update_message_scroll_region)
         self.message_canvas.bind("<Configure>", self._resize_message_frame)
         self.root.bind_all("<MouseWheel>", self._scroll_messages)
@@ -282,32 +307,112 @@ class ChatWindow:
         # Keep the sorting actions in their own right-hand box.
         panel = tk.Frame(parent, bg=PANEL, bd=1, relief="solid", padx=8, pady=8)
         panel.grid(row=0, column=1, sticky="ns", padx=(24, 0))
-        for row, (label, command) in enumerate((("Most Recent", self._keep_order), ("Alphabetical", self._sort_alphabetical), ("Frequency", self._keep_order), ("Date Added", self._keep_order), ("New Messages", self._keep_order))):
-            tk.Button(panel, text=label, command=command, bg=BUTTON, fg=TEXT, font=("Arial", 9), bd=1, relief="solid", width=16, pady=10).grid(
+        self.sort_buttons = {}
+        for row, (label, mode) in enumerate((("Most Recent", "most_recent"), ("Alphabetical", "alphabetical"), ("Frequency", "frequency"), ("Date Added", "date_added"), ("New Messages", "new_messages"))):
+            command = lambda selected=mode: self._set_sort_mode(selected)
+            button = tk.Button(panel, text=label, command=command, bg=BUTTON, fg=TEXT, font=("Arial", 9), bd=1, relief="solid", width=16, pady=10)
+            button.grid(
                 row=row, column=0, pady=(0, 8), sticky="ew"
             )
+            self.sort_buttons[mode] = button
 
     def _label(self, parent, text, row, column, **options):
         # Create a square-edged blue label used by the layout.
         tk.Label(parent, text=text, bg=BUTTON, fg=TEXT, bd=1, relief="solid", **options).grid(row=row, column=column, sticky="ew", pady=(0, 8))
 
+    def _post_ui(self, callback, *args):
+        # Worker threads only enqueue data; Tk widgets stay on the UI thread.
+        self._ui_results.put((callback, args))
+
+    def _drain_background(self):
+        for _ in range(100):
+            try:
+                callback, args = self._ui_results.get_nowait()
+            except queue.Empty:
+                break
+            callback(*args)
+        self.root.after(UI_RESULT_INTERVAL_MS, self._drain_background)
+
+    def _run_background(self, work, on_complete):
+        def run():
+            try:
+                result = work()
+                error = None
+            except Exception as caught:
+                result, error = None, caught
+            self._post_ui(on_complete, result, error)
+
+        threading.Thread(target=run, daemon=True).start()
+
     def _load_users(self):
         # Ask the server for usernames used by the add-user menu.
-        try:
+        def fetch():
             with open_server(f"{self.server_url}/users", timeout=5) as response:
-                self.users = json.loads(response.read().decode("utf-8")).get("users", [])
-        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
-            self.users = []
-        self._filter_users()
+                return json.loads(response.read().decode("utf-8")).get("users", [])
+
+        def loaded(users, error):
+            self.users = users if error is None else []
+            self._filter_users()
+
+        self._run_background(fetch, loaded)
 
     def _load_contacts(self):
-        # Restore the contacts this account saved from a previous session or device.
-        try:
+        # Fetch saved contacts and the server-side metrics used by the sort buttons.
+        if self._contacts_request is not None:
+            self._contacts_refresh_pending = True
+            return
+        request_token = object()
+        self._contacts_request = request_token
+
+        def fetch():
             with open_server(f"{self.server_url}/contacts", timeout=5) as response:
-                self.contacts = json.loads(response.read().decode("utf-8")).get("contacts", [])
-        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
-            self.contacts = []
-        self._filter_users()
+                return json.loads(response.read().decode("utf-8"))
+
+        def loaded(page, error):
+            if self._contacts_request is not request_token:
+                return
+            self._contacts_request = None
+            if error is None:
+                self.contacts = page.get("contacts", [])
+                self.contact_details = {
+                    item["name"]: item for item in page.get("contact_details", [])
+                }
+                self._filter_users()
+            if self._contacts_refresh_pending:
+                self._contacts_refresh_pending = False
+                self._load_contacts()
+
+        self._run_background(fetch, loaded)
+
+    def _refresh_contact_sort(self):
+        if self._sort_mode in ("most_recent", "frequency", "new_messages"):
+            self._load_contacts()
+        self.root.after(CONTACT_SORT_REFRESH_MS, self._refresh_contact_sort)
+
+    def _mark_read_through(self, contact, message_id):
+        # Persist only messages actually reached in the open conversation.
+        previous = self._read_sent.get(contact, 0)
+        if message_id <= previous:
+            return
+        self._read_sent[contact] = message_id
+        request = Request(
+            f"{self.server_url}/contacts/read",
+            data=json.dumps({"contact": contact, "through_id": message_id}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+
+        def mark():
+            with open_server(request, timeout=5) as response:
+                return json.loads(response.read().decode("utf-8")).get("success", False)
+
+        def marked(success, error):
+            if error is not None or not success:
+                if self._read_sent.get(contact) == message_id:
+                    self._read_sent[contact] = previous
+            else:
+                self._load_contacts()
+
+        self._run_background(mark, marked)
 
     def _clear_search_hint(self, event):
         # Remove the search hint when the field receives focus.
@@ -315,34 +420,64 @@ class ChatWindow:
             self.search_text.set("")
 
     def _filter_users(self, *args):
-        # Refresh the message list with saved contacts that match the search term.
+        # Search and sort contacts while keeping the current chat selected.
         query = self.search_text.get().lower()
         matches = self.contacts if query == "search" else [user for user in self.contacts if query in user.lower()]
+        if self._sort_mode == "alphabetical":
+            matches = sorted(matches, key=str.casefold)
+        elif self._sort_mode == "most_recent":
+            matches = sorted(matches, key=lambda user: (
+                -self.contact_details.get(user, {}).get("latest_message_id", 0), user.casefold()
+            ))
+        elif self._sort_mode == "frequency":
+            matches = sorted(matches, key=lambda user: (
+                -self.contact_details.get(user, {}).get("message_count", 0),
+                -self.contact_details.get(user, {}).get("latest_message_id", 0),
+                user.casefold(),
+            ))
+        elif self._sort_mode == "date_added":
+            matches = sorted(matches, key=lambda user: (
+                -self.contact_details.get(user, {}).get("added_at", 0), user.casefold()
+            ))
+        elif self._sort_mode == "new_messages":
+            matches = [user for user in matches if self.contact_details.get(user, {}).get("unread_count", 0) > 0]
+            matches = sorted(matches, key=lambda user: (
+                -self.contact_details[user]["unread_count"],
+                -self.contact_details[user].get("latest_message_id", 0),
+                user.casefold(),
+            ))
+        self._displayed_contacts = list(matches)
         self.user_list.delete(0, "end")
         for user in matches:
-            self.user_list.insert("end", user)
+            unread = self.contact_details.get(user, {}).get("unread_count", 0)
+            self.user_list.insert("end", f"{user} ({unread})" if unread else user)
+        if self.recipient in matches:
+            self.user_list.selection_set(matches.index(self.recipient))
 
-    def _sort_alphabetical(self):
-        # Sort the selected contacts alphabetically.
-        self.contacts.sort(key=str.lower)
+    def _set_sort_mode(self, mode):
+        self._sort_mode = mode
+        for button_mode, button in self.sort_buttons.items():
+            button.configure(relief="sunken" if button_mode == mode else "solid")
         self._filter_users()
-
-    def _keep_order(self):
-        # Preserve database order until messages are stored by the server.
-        self._filter_users()
+        if mode in ("most_recent", "frequency", "new_messages"):
+            self._load_contacts()
 
     def _select_user(self, event):
         # Change the current chat label when a user is selected.
         selected = self.user_list.curselection()
-        if selected:
-            self._open_conversation(self.user_list.get(selected[0]))
+        if selected and selected[0] < len(self._displayed_contacts):
+            recipient = self._displayed_contacts[selected[0]]
+            if recipient != self.recipient:
+                self._open_conversation(recipient)
 
     def _open_contact_menu(self, event):
         # Select the right-clicked contact before showing its actions.
         index = self.user_list.nearest(event.y)
         bounds = self.user_list.bbox(index)
-        if not bounds or not bounds[1] <= event.y <= bounds[1] + bounds[3]:
+        if (not bounds or index >= len(self._displayed_contacts)
+                or not bounds[1] <= event.y <= bounds[1] + bounds[3]):
             return
+        self._context_contact = self._displayed_contacts[index]
         self.user_list.selection_clear(0, "end")
         self.user_list.selection_set(index)
         try:
@@ -352,10 +487,13 @@ class ChatWindow:
 
     def _delete_selected_contact(self):
         # Remove only the selected account from this user's saved chat list.
-        selected = self.user_list.curselection()
-        if not selected:
+        if self._contact_delete_in_flight:
             return
-        contact = self.user_list.get(selected[0])
+        selected = self.user_list.curselection()
+        if self._context_contact is None and (not selected or selected[0] >= len(self._displayed_contacts)):
+            return
+        contact = self._context_contact or self._displayed_contacts[selected[0]]
+        self._context_contact = None
         data = json.dumps({"contact": contact}).encode("utf-8")
         request = Request(
             f"{self.server_url}/contacts",
@@ -363,23 +501,34 @@ class ChatWindow:
             headers={"Content-Type": "application/json"},
             method="DELETE",
         )
-        try:
+        self._contact_delete_in_flight = True
+
+        def remove():
             with open_server(request, timeout=5) as response:
-                success = json.loads(response.read().decode("utf-8")).get("success", False)
-        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
-            success = False
-        if not success:
-            self.send_status.set("Could not delete that contact.")
-            return
-        self.contacts.remove(contact)
-        self._filter_users()
-        if self.recipient == contact:
-            self.recipient = None
-            self.current_messages = None
-            self.chat_title.set("Chat user")
-            self._clear_messages()
-            self._show_empty_conversation()
-            self._scroll_to_latest()
+                return json.loads(response.read().decode("utf-8")).get("success", False)
+
+        def removed(success, error):
+            self._contact_delete_in_flight = False
+            if error is not None or not success:
+                self.send_status.set("Could not delete that contact.")
+                return
+            if contact in self.contacts:
+                self.contacts.remove(contact)
+            self.contact_details.pop(contact, None)
+            self._filter_users()
+            self._load_contacts()
+            if self.recipient == contact:
+                self._conversation_generation += 1
+                self.recipient = None
+                self.current_messages = None
+                self._history_request = None
+                self._poll_request = None
+                self.chat_title.set("Chat user")
+                self._clear_messages()
+                self._show_empty_conversation()
+                self._scroll_to_latest()
+
+        self._run_background(remove, removed)
 
     def _open_add_user_menu(self):
         # Show registered accounts only when the user chooses to add a contact.
@@ -414,15 +563,25 @@ class ChatWindow:
             if not selected:
                 return
             user = user_picker.get(selected[0])
-            if not self._save_contact(user):
-                self.send_status.set("Could not save that user to your chats.")
-                return
-            self.contacts.append(user)
-            self._filter_users()
-            self._open_conversation(user)
-            menu.destroy()
+            add_button.configure(state="disabled")
 
-        tk.Button(menu, text="Add", command=add_selected_user, bg=BUTTON, fg=TEXT, bd=1, relief="solid", padx=18).pack(pady=(10, 0))
+            def saved(success, error):
+                if not menu.winfo_exists():
+                    return
+                if error is not None or not success:
+                    add_button.configure(state="normal")
+                    self.send_status.set("Could not save that user to your chats.")
+                    return
+                self.contacts.append(user)
+                self._filter_users()
+                self._open_conversation(user)
+                self._load_contacts()
+                menu.destroy()
+
+            self._run_background(lambda: self._save_contact(user), saved)
+
+        add_button = tk.Button(menu, text="Add", command=add_selected_user, bg=BUTTON, fg=TEXT, bd=1, relief="solid", padx=18)
+        add_button.pack(pady=(10, 0))
 
     def _save_contact(self, contact):
         # Save an added user so the sidebar can be restored next time this user logs in.
@@ -439,52 +598,197 @@ class ChatWindow:
             return False
 
     def _open_conversation(self, recipient):
-        # Load the selected account's saved conversation immediately.
+        # Replace only this conversation's page when the selection changes.
+        self._conversation_generation += 1
         self.recipient = recipient
         self.current_messages = None
+        self._has_older = False
+        self._has_newer = False
+        self._history_request = None
+        self._poll_request = None
         self.send_status.set("")
         self.chat_title.set(f"Chat user: {recipient}")
-        self._refresh_conversation(scroll_to_top=True)
+        self._clear_messages()
+        self._add_message("BlueBubbles", "Loading messages...", "", True)
+        self._load_page("latest")
 
-    def _fetch_conversation(self):
-        # Retrieve the active conversation without changing the visible chat.
-        parameters = urlencode({"with": self.recipient})
-        try:
-            with open_server(f"{self.server_url}/messages?{parameters}", timeout=5) as response:
-                return json.loads(response.read().decode("utf-8")).get("messages", [])
-        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
-            return None
+    def _fetch_conversation(self, recipient, before_id=None, after_id=None):
+        # The server sends at most 100 rows and a cursor for either direction.
+        parameters = {"with": recipient}
+        if before_id is not None:
+            parameters["before_id"] = before_id
+        if after_id is not None:
+            parameters["after_id"] = after_id
+        with open_server(f"{self.server_url}/messages?{urlencode(parameters)}", timeout=5) as response:
+            page = json.loads(response.read().decode("utf-8"))
+        messages = page.get("messages")
+        if (
+            not isinstance(messages, list)
+            or not isinstance(page.get("has_more"), bool)
+            or len(messages) > MESSAGE_PAGE_SIZE
+            or any(not isinstance(message.get("id"), int) for message in messages)
+        ):
+            raise ValueError("The server does not support bounded message pages.")
+        return page
 
-    def _refresh_conversation(self, scroll_to_top=False, scroll_to_latest=False):
-        # Redraw only when polling finds a new or changed message.
-        saved_messages = self._fetch_conversation()
-        if saved_messages is None or saved_messages == self.current_messages:
+    def _load_page(self, direction):
+        if self._history_request is not None or not self.recipient:
+            return
+        if direction != "latest" and not self.current_messages:
+            return
+        recipient = self.recipient
+        generation = self._conversation_generation
+        cursor = None
+        if direction == "older":
+            cursor = self.current_messages[0]["id"]
+        elif direction == "newer":
+            cursor = self.current_messages[-1]["id"]
+        request_token = object()
+        self._history_request = request_token
+        self._poll_request = None
+
+        def fetch():
+            return self._fetch_conversation(
+                recipient,
+                before_id=cursor if direction == "older" else None,
+                after_id=cursor if direction == "newer" else None,
+            )
+
+        def loaded(page, error):
+            if self._history_request is not request_token or generation != self._conversation_generation:
+                return
+            self._history_request = None
+            if error is not None:
+                self.send_status.set(
+                    "Update the server before using message paging."
+                    if isinstance(error, ValueError) else "Could not load messages."
+                )
+                return
+            saved_messages = page["messages"]
+            if direction == "older" and not saved_messages:
+                self._has_older = False
+                return
+            if direction == "newer" and not saved_messages:
+                self._has_newer = False
+                return
+            self.current_messages = saved_messages
+            if direction == "latest":
+                self._has_older, self._has_newer = page["has_more"], False
+            elif direction == "older":
+                self._has_older, self._has_newer = page["has_more"], True
+            else:
+                self._has_older, self._has_newer = True, page["has_more"]
+            self._clear_messages()
+            for message in saved_messages:
+                self._add_saved_message(message)
+            if not saved_messages:
+                self._add_message(self.recipient, "No messages yet.", "", True)
+            if direction == "newer":
+                self._scroll_to_top()
+            else:
+                self._scroll_to_latest()
+            if saved_messages and not self._has_newer:
+                self._mark_read_through(recipient, saved_messages[-1]["id"])
+
+        self._run_background(fetch, loaded)
+
+    def _append_new_messages(self, new_messages, scroll_to_latest=False):
+        if not new_messages or self.current_messages is None:
             return
         was_at_latest = self.message_canvas.yview()[1] >= 0.99
-        self._clear_messages()
-        for message in saved_messages:
-            self._add_message(
-                message["sender"],
-                message["content"],
-                message["time"],
-                message["sender"] != self.username,
-                message.get("date", ""),
-                message.get("file_id"),
-                message.get("filename"),
-            )
-        if not saved_messages:
-            self._add_message(self.recipient, "No messages yet.", "", True)
-        self.current_messages = saved_messages
-        if scroll_to_top:
-            self._scroll_to_top()
-        elif scroll_to_latest or was_at_latest:
+        existing = {message["id"] for message in self.current_messages}
+        additions = [message for message in new_messages if message["id"] not in existing]
+        if not additions:
+            return
+        additions.sort(key=lambda message: message["id"])
+        if self.current_messages and additions[0]["id"] < self.current_messages[-1]["id"]:
+            merged = {message["id"]: message for message in self.current_messages + additions}
+            if len(merged) > MESSAGE_PAGE_SIZE:
+                self._has_older = True
+            self.current_messages = sorted(merged.values(), key=lambda message: message["id"])[-MESSAGE_PAGE_SIZE:]
+            self._clear_messages()
+            for message in self.current_messages:
+                self._add_saved_message(message)
+        else:
+            if not self.current_messages:
+                self._clear_messages()
+            for message in additions:
+                self._add_saved_message(message)
+            self.current_messages.extend(additions)
+            excess = len(self.current_messages) - MESSAGE_PAGE_SIZE
+            if excess > 0:
+                del self.current_messages[:excess]
+                for child in self.messages.winfo_children()[:excess]:
+                    child.destroy()
+                self._has_older = True
+        if scroll_to_latest or was_at_latest:
             self._scroll_to_latest()
 
+    def _add_saved_message(self, message):
+        self._add_message(
+            message["sender"],
+            message["content"],
+            message["time"],
+            message["sender"] != self.username,
+            message.get("date", ""),
+            message.get("file_id"),
+            message.get("filename"),
+        )
+
     def _schedule_message_refresh(self):
-        # Check the open conversation regularly so another device's messages appear.
-        if self.recipient:
-            self._refresh_conversation()
+        # Poll for only rows newer than the last displayed message.
+        self._poll_new_messages()
         self.root.after(REFRESH_INTERVAL_MS, self._schedule_message_refresh)
+
+    def _poll_new_messages(self):
+        if (
+            not self.recipient or self.current_messages is None or self._has_newer
+            or self._history_request is not None or self._poll_request is not None
+            or self._send_in_flight
+        ):
+            return
+        recipient = self.recipient
+        generation = self._conversation_generation
+        cursor = self.current_messages[-1]["id"] if self.current_messages else None
+        request_token = object()
+        self._poll_request = request_token
+
+        def fetch():
+            return self._fetch_conversation(recipient, after_id=cursor)
+
+        def loaded(page, error):
+            if self._poll_request is not request_token or generation != self._conversation_generation:
+                return
+            self._poll_request = None
+            if error is not None:
+                if isinstance(error, ValueError):
+                    self.send_status.set("Update the server before using message paging.")
+                return
+            if cursor is None:
+                if not page["messages"] and not self.current_messages:
+                    return
+                self.current_messages = page["messages"]
+                self._has_older = page["has_more"]
+                self._clear_messages()
+                for message in self.current_messages:
+                    self._add_saved_message(message)
+                if not self.current_messages:
+                    self._add_message(self.recipient, "No messages yet.", "", True)
+                else:
+                    self._scroll_to_latest()
+                    self._mark_read_through(recipient, self.current_messages[-1]["id"])
+            else:
+                was_at_latest = self.message_canvas.yview()[1] >= 0.99
+                self._append_new_messages(page["messages"])
+                if page["messages"]:
+                    if was_at_latest:
+                        self._mark_read_through(recipient, self.current_messages[-1]["id"])
+                    if self._sort_mode in ("most_recent", "frequency", "new_messages"):
+                        self._load_contacts()
+            if page["has_more"] and cursor is not None:
+                self._poll_new_messages()
+
+        self._run_background(fetch, loaded)
 
     def _clear_messages(self):
         # Remove all currently displayed message rows.
@@ -513,7 +817,23 @@ class ChatWindow:
         else:
             amount = -1 if event.num == 4 else 1
         self.message_canvas.yview_scroll(amount, "units")
+        self.root.after_idle(self._maybe_load_history)
         return "break"
+
+    def _scrollbar_scroll(self, *args):
+        self.message_canvas.yview(*args)
+        self.root.after_idle(self._maybe_load_history)
+
+    def _maybe_load_history(self):
+        if not self.current_messages or self._history_request is not None:
+            return
+        top, bottom = self.message_canvas.yview()
+        if top <= 0.001 and self._has_older:
+            self._load_page("older")
+        elif bottom >= 0.999 and self._has_newer:
+            self._load_page("newer")
+        elif bottom >= 0.999 and self.current_messages:
+            self._mark_read_through(self.recipient, self.current_messages[-1]["id"])
 
     def _scroll_to_latest(self):
         # Show the most recent message after sending or receiving a new one.
@@ -530,15 +850,31 @@ class ChatWindow:
         self._add_message("BlueBubbles", "Choose an account from the users list to start chatting.", "", True)
 
     def _add_message(self, sender, text, time, incoming, sent_date="", file_id=None, filename=None):
-        # Add a plain message line to the conversation area.
-        row = self.messages.grid_size()[1]
+        # Give each side a fixed-width column so message text starts consistently.
         block = tk.Frame(self.messages, bg=WHITE)
-        block.grid(row=row, column=0, sticky="w" if incoming else "e", padx=10, pady=(10, 0))
+        block.pack(fill="x", padx=12, pady=(8, 0))
+        bubble_color = WHITE
+        bubble = tk.Frame(
+            block, bg=bubble_color, bd=0, padx=10, pady=7,
+        )
+        bubble.pack(side="left" if incoming else "right")
+        bubble.grid_columnconfigure(0, minsize=MESSAGE_BUBBLE_WIDTH)
+
+        header = tk.Frame(bubble, bg=bubble_color)
+        header.grid(row=0, column=0, sticky="ew")
+        tk.Label(
+            header, text=sender, bg=bubble_color, fg=TEXT,
+            font=("Arial", 9, "bold"),
+        ).pack(side="left")
         timestamp = " ".join(value for value in (sent_date, time) if value)
-        tk.Label(block, text=f"{sender}    {timestamp}".strip(), bg=WHITE, fg=TEXT, font=("Arial", 9, "bold")).pack(anchor="w")
+        if timestamp:
+            tk.Label(
+                header, text=timestamp, bg=bubble_color, fg="#60788c",
+                font=("Arial", 9),
+            ).pack(side="right")
         if file_id and filename:
             tk.Button(
-                block,
+                bubble,
                 text=filename,
                 command=lambda: self._download_file(file_id, filename),
                 bg=BUTTON,
@@ -546,13 +882,22 @@ class ChatWindow:
                 font=("Arial", 10, "underline"),
                 bd=1,
                 relief="solid",
-            ).pack(anchor="w", pady=(3, 0))
+                anchor="w",
+                wraplength=MESSAGE_BUBBLE_WIDTH - 20,
+            ).grid(row=1, column=0, sticky="ew", pady=(5, 0))
         else:
-            tk.Label(block, text=text, bg=WHITE, fg="#526b7e", font=("Arial", 10), justify="left", wraplength=430).pack(anchor="w", pady=(3, 0))
+            tk.Label(
+                bubble, text=text, bg=bubble_color, fg="#334f66",
+                font=("Arial", 10), justify="left", anchor="w",
+                wraplength=MESSAGE_BUBBLE_WIDTH,
+            ).grid(row=1, column=0, sticky="ew", pady=(5, 0))
+        return block
 
     def send_message(self):
-        # Send an attached file only when the user explicitly presses Send.
+        # Show text immediately, then complete both requests off the UI thread.
         text = self.message_text.get().strip()
+        if self._send_in_flight or self._attachment_check is not None:
+            return
         if not self.recipient:
             self.send_status.set("Choose a user before sending a message.")
             return
@@ -560,19 +905,92 @@ class ChatWindow:
             self.send_status.set("Write a message or attach a file before sending.")
             self.message_entry.focus_set()
             return
-        if self.attachment is not None and not self._send_attached_file():
-            return
-        if text and not self._send_text_message(text):
-            return
+        recipient = self.recipient
+        generation = self._conversation_generation
+        attachment = self.attachment
+        self._send_in_flight = True
+        self._set_send_controls(False)
+        pending = None
+        if text:
+            if not self.current_messages:
+                self._clear_messages()
+            pending = self._add_message(self.username, text, "Sending...", False)
+            self._scroll_to_latest()
         if text:
             self.message_text.set("")
-        self.send_status.set("")
-        self._refresh_conversation(scroll_to_latest=True)
+        self.send_status.set("Sending...")
+        if attachment is not None:
+            self.attachment_progress.set(0)
+            self.attachment_status.set(f"Uploading: {attachment['filename']} (0%)")
 
-    def _send_text_message(self, text):
-        # Keep the existing encrypted text-message request as a separate send operation.
+        def show_text_receipt(saved_message):
+            if pending is not None and pending.winfo_exists():
+                pending.destroy()
+            if self.recipient == recipient and generation == self._conversation_generation:
+                if self.current_messages is None or self._has_newer:
+                    self._history_request = None
+                    self.current_messages = []
+                    self._has_newer = False
+                    self._append_new_messages([saved_message], scroll_to_latest=True)
+                    self._load_page("latest")
+                else:
+                    self._append_new_messages([saved_message], scroll_to_latest=True)
+
+        def work():
+            saved = []
+            file_sent = False
+            text_sent = False
+            if text:
+                response = self._send_text_message(recipient, text)
+                if not response.get("success"):
+                    return saved, file_sent, text_sent, response.get("message", "Message could not be sent.")
+                text_sent = True
+                if response.get("saved_message"):
+                    saved.append(response["saved_message"])
+                    if attachment is not None:
+                        self._post_ui(show_text_receipt, response["saved_message"])
+            if attachment is not None:
+                response = self._send_attached_file(recipient, attachment)
+                if not response.get("success"):
+                    return saved, file_sent, text_sent, response.get("message", "The file could not be uploaded.")
+                file_sent = True
+                if response.get("saved_message"):
+                    saved.append(response["saved_message"])
+            return saved, file_sent, text_sent, ""
+
+        def completed(result, error):
+            self._send_in_flight = False
+            self._set_send_controls(True)
+            if pending is not None and pending.winfo_exists():
+                pending.destroy()
+            if error is not None:
+                result = ([], False, False, "Could not reach the server. Try again.")
+            saved, file_sent, text_sent, message = result
+            if file_sent and self.attachment is attachment:
+                self._clear_attachment()
+            if text and not text_sent:
+                self.message_text.set(text)
+            if self.recipient == recipient and generation == self._conversation_generation:
+                if (self.current_messages is None or self._has_newer) and saved:
+                    # Show the receipt now, then reconcile the latest page.
+                    self._history_request = None
+                    self.current_messages = []
+                    self._has_newer = False
+                    self._append_new_messages(saved, scroll_to_latest=True)
+                    self._load_page("latest")
+                else:
+                    self._append_new_messages(saved, scroll_to_latest=True)
+                if not saved and not self.current_messages:
+                    self._clear_messages()
+                    self._add_message(self.recipient, "No messages yet.", "", True)
+                self.send_status.set(message)
+                self._poll_new_messages()
+
+        self._run_background(work, completed)
+
+    def _send_text_message(self, recipient, text):
         data = json.dumps(
-            {"recipient": self.recipient, "content": text}
+            {"recipient": recipient, "content": text}
         ).encode("utf-8")
         request = Request(
             f"{self.server_url}/messages",
@@ -581,27 +999,21 @@ class ChatWindow:
         )
         try:
             with open_server(request, timeout=5) as response:
-                body = json.loads(response.read().decode("utf-8"))
+                return json.loads(response.read().decode("utf-8"))
         except HTTPError as error:
             try:
-                body = json.loads(error.read().decode("utf-8"))
-                self.send_status.set(body.get("message", "Message could not be sent."))
+                return json.loads(error.read().decode("utf-8"))
             except json.JSONDecodeError:
-                self.send_status.set("Message could not be sent.")
-            return False
+                return {"success": False, "message": "Message could not be sent."}
         except (URLError, TimeoutError, json.JSONDecodeError):
-            self.send_status.set("Could not reach the server. Try again.")
-            return False
-
-        if not body.get("success"):
-            self.send_status.set(body.get("message", "Message could not be sent."))
-            return False
-        return True
+            return {"success": False, "message": "Could not reach the server. Try again."}
 
     def attach_file(self):
-        # Select locally now; no file leaves the client until Send is pressed.
+        # Check the selected local file in the background; do not copy it.
         if not self.recipient:
             self.send_status.set("Choose a user before attaching a file.")
+            return
+        if self._send_in_flight or self._attachment_check is not None:
             return
         path = filedialog.askopenfilename(parent=self.root)
         if not path:
@@ -614,42 +1026,60 @@ class ChatWindow:
         if file_size > MAXIMUM_FILE_BYTES:
             self.send_status.set("Files cannot be larger than 2 GB.")
             return
-        try:
-            checksum = self._file_checksum(path)
-        except OSError:
-            self.send_status.set("Could not verify that file.")
-            return
-        self.attachment = {
-            "path": path,
-            # basename retains the original extension, e.g. "report.pdf".
-            "filename": os.path.basename(path),
-            "size": file_size,
-            "checksum": checksum,
-        }
-        self.attachment_progress.set(0)
-        self.attachment_status.set(
-            f"Attached: {self.attachment['filename']} ({self._file_size_label(file_size)}) — press Send"
-        )
+        check_token = object()
+        self._attachment_check = check_token
+        generation = self._conversation_generation
+        self._set_send_controls(False)
+        self.attachment_status.set(f"Checking: {os.path.basename(path)}")
         self.attachment_frame.grid()
-        self.send_status.set("")
 
-    def _send_attached_file(self):
-        # Stream the selected file and update the bar as bytes leave the client.
-        attachment = self.attachment
+        def checked(checksum, error):
+            if self._attachment_check is not check_token:
+                return
+            self._attachment_check = None
+            self._set_send_controls(True)
+            if generation != self._conversation_generation:
+                self._clear_attachment()
+                return
+            if error is not None:
+                self._clear_attachment()
+                self.send_status.set("Could not verify that file.")
+                return
+            self.attachment = {
+                "path": path,
+                "filename": os.path.basename(path),
+                "size": file_size,
+                "checksum": checksum,
+            }
+            self.attachment_progress.set(0)
+            self.attachment_status.set(
+                f"Attached: {self.attachment['filename']} ({self._file_size_label(file_size)}) — press Send"
+            )
+            self.send_status.set("")
+
+        self._run_background(lambda: self._file_checksum(path), checked)
+
+    def _send_attached_file(self, recipient, attachment):
+        # This runs on a worker; progress is passed back to the UI queue.
+        last_report = [0.0]
+
+        def report(sent_bytes, total_bytes):
+            now = time.monotonic()
+            if sent_bytes < total_bytes and now - last_report[0] < 0.1:
+                return
+            last_report[0] = now
+            self._post_ui(self._update_attachment_progress, sent_bytes, total_bytes, attachment)
+
         try:
             body = MultipartFileBody(
-                self.recipient,
+                recipient,
                 attachment["filename"],
                 attachment["path"],
                 attachment["checksum"],
-                self._update_attachment_progress,
+                report,
             )
         except OSError:
-            self.send_status.set("Could not read the attached file. Attach it again.")
-            return False
-        self._set_send_controls(False)
-        self.attachment_progress.set(0)
-        self.attachment_status.set(f"Uploading: {attachment['filename']} (0%)")
+            return {"success": False, "message": "Could not read the attached file. Attach it again."}
         try:
             request = Request(
                 f"{self.server_url}/files",
@@ -663,33 +1093,27 @@ class ChatWindow:
                 response_body = json.loads(response.read().decode("utf-8"))
         except HTTPError as error:
             try:
-                response_body = json.loads(error.read().decode("utf-8"))
-                self.send_status.set(response_body.get("message", "The file could not be uploaded."))
+                return json.loads(error.read().decode("utf-8"))
             except json.JSONDecodeError:
-                self.send_status.set("The file could not be uploaded.")
-            return False
+                return {"success": False, "message": "The file could not be uploaded."}
         except (URLError, TimeoutError, json.JSONDecodeError):
-            self.send_status.set("Could not reach the server. Try again.")
-            return False
+            return {"success": False, "message": "Could not reach the server. Try again."}
         finally:
             body.close()
-            self._set_send_controls(True)
         if not response_body.get("success"):
-            self.send_status.set(response_body.get("message", "The file could not be uploaded."))
-            return False
+            return response_body
         if response_body.get("checksum") != attachment["checksum"]:
-            self.send_status.set("The server did not confirm the file checksum.")
-            return False
-        self._clear_attachment()
-        return True
+            return {"success": False, "message": "The server did not confirm the file checksum."}
+        return response_body
 
-    def _update_attachment_progress(self, sent_bytes, total_bytes):
+    def _update_attachment_progress(self, sent_bytes, total_bytes, attachment):
+        if self.attachment is not attachment or not self._send_in_flight:
+            return
         percentage = 100 if not total_bytes else sent_bytes * 100 / total_bytes
         self.attachment_progress.set(percentage)
         self.attachment_status.set(
-            f"Uploading: {self.attachment['filename']} ({percentage:.0f}%)"
+            f"Uploading: {attachment['filename']} ({percentage:.0f}%)"
         )
-        self.root.update_idletasks()
 
     def _clear_attachment(self):
         self.attachment = None
@@ -699,6 +1123,7 @@ class ChatWindow:
 
     def _set_send_controls(self, enabled):
         state = "normal" if enabled else "disabled"
+        self.message_entry.configure(state=state)
         self.send_button.configure(state=state)
         self.attach_button.configure(state=state)
         self.remove_attachment_button.configure(state=state)
@@ -720,10 +1145,24 @@ class ChatWindow:
         return digest.hexdigest()
 
     def _download_file(self, file_id, filename):
-        # The server returns decrypted bytes only after checking this user is a participant.
+        # Received attachments stay on the server until this button is clicked.
+        if self._download_in_flight:
+            return
         target = filedialog.asksaveasfilename(parent=self.root, initialfile=filename)
         if not target:
             return
+        self._download_in_flight = True
+        self.send_status.set(f"Downloading {filename}...")
+
+        def finished(_result, error):
+            self._download_in_flight = False
+            self.send_status.set(
+                "The file could not be downloaded or verified." if error is not None else ""
+            )
+
+        self._run_background(lambda: self._download_to_path(file_id, target), finished)
+
+    def _download_to_path(self, file_id, target):
         request = Request(f"{self.server_url}/files/{quote(file_id)}")
         temporary_path = None
         try:
@@ -743,13 +1182,9 @@ class ChatWindow:
                     raise OSError("Downloaded file checksum does not match.")
             os.replace(temporary_path, target)
             temporary_path = None
-        except (OSError, HTTPError, URLError, TimeoutError):
-            self.send_status.set("The file could not be downloaded or verified.")
-            return
         finally:
             if temporary_path:
                 Path(temporary_path).unlink(missing_ok=True)
-        self.send_status.set("")
 
     def _send_from_enter(self, event):
         # Send the message when Enter is pressed in the message field.
