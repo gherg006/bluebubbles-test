@@ -1,5 +1,6 @@
 # The simple login and registration screen shown by the client.
 
+
 import json
 import tkinter as tk
 from tkinter import ttk

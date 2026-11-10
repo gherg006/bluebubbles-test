@@ -6,63 +6,76 @@ import ssl
 from http.cookiejar import CookieJar
 from pathlib import Path
 from urllib.parse import urlsplit
+#New libraries to handle cookie authentication and HTTPS.
 from urllib.request import HTTPCookieProcessor, HTTPSHandler, build_opener
+#All external libraries are imported at the start of the file.
 
-
+#The server IP as well as the certificate file are put here so that if locations change, I am able to change them here.
 DEFAULT_SERVER_URL = "https://192.168.0.150:5000"
 _BUNDLED_CA_FILE = Path(__file__).with_name("certificates") / "bluebubbles-lan-root-ca.pem"
+
+#The session cookie is authenticated, which is stored in a global variable.
 _SESSION_COOKIES = CookieJar()
 
 
 class TransportSecurityError(ValueError):
-    # Raised when the client is configured to use an insecure server URL.
+    #Raised when the client is configured to use an insecure server URL.
     pass
 
 
 def server_url():
-    # Return the configured HTTPS endpoint, rejecting plaintext HTTP outright.
+    #Return the configured HTTPS endpoint, rejecting plaintext HTTP.
     url = os.getenv("BLUEBUBBLES_SERVER_URL", DEFAULT_SERVER_URL).rstrip("/")
     parsed = urlsplit(url)
+    #Ensures that HTTPS is being used, and not HTTP.
     if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
         raise TransportSecurityError(
             "BLUEBUBBLES_SERVER_URL must be an HTTPS URL, for example "
             "https://192.168.0.150:5000."
         )
+    #The HTTPS url is returned.
     return url
 
 
 def _certificate_authority_file():
-    # Prefer an explicit CA, otherwise use the LAN CA packaged with the client.
+    #Prefer an explicit CA, otherwise use the LAN CA packaged with the client (used during program dev).
     configured = os.getenv("BLUEBUBBLES_CA_CERT_FILE")
     if configured:
+        #Simply returns the certificate file so that the program doesn't have direct access to it.
         return Path(configured)
     return _BUNDLED_CA_FILE if _BUNDLED_CA_FILE.is_file() else None
 
 
 def ssl_context():
-    # Build a verifying TLS context; certificate and hostname checks stay enabled.
+    #Build a TLS context with hostname and certificate checks.
     context = ssl.create_default_context()
+    #Sets the minimum version to TLS1.2.
     context.minimum_version = ssl.TLSVersion.TLSv1_2
+    #Certificate is put into a variable.
     ca_file = _certificate_authority_file()
     if ca_file:
+        #If the certificate is good, it will return the context for ssl.
         context.load_verify_locations(cafile=str(ca_file))
     return context
 
 
-def open_server(request, timeout=5):
-    # Keep the HTTPS-only, HttpOnly server session for this client process.
+def open_server(request, timeout=5):            #Replaces urlopen everywhere else. More secure this way.
+    #Keep the HTTPS handler.
     opener = build_opener(
         HTTPCookieProcessor(_SESSION_COOKIES), HTTPSHandler(context=ssl_context())
     )
+    #Open and execute the network request with the timeout.
     return opener.open(request, timeout=timeout)
 
 
 def connection_error_message(error):
-    # Turn common secure-connection failures into actionable login feedback.
+    #Common connection error messages turn into messages the user is able to read.
+    #Reason is grabbed from the error.
+    #Not going to comment each error, they are self explanatory from the error messages.
     reason = getattr(error, "reason", error)
     if isinstance(reason, ssl.SSLCertVerificationError):
         return (
-            "Secure server verification failed. Update the complete client folder "
+            "Secure server verification failed. Update the complete client folder."
             "so client/certificates/bluebubbles-lan-root-ca.pem is present."
         )
     if isinstance(reason, ssl.SSLError):

@@ -1,4 +1,4 @@
-# Start point for program
+#Start point for program
 
 import tkinter as tk
 
