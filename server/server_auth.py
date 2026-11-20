@@ -437,7 +437,8 @@ def send_message():
     if saved:
         #If it all works, then the message is sent.
         return jsonify(success=True, message="Message sent.", saved_message=saved), 201
-    return jsonify(success=False, message="The message could not be sent."), 400
+    detail = getattr(messages, "last_error", "") or "Unknown error"
+    return jsonify(success=False, message=f"The message could not be sent: {detail}"), 400
 
 
 @app.post("/files")

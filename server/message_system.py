@@ -274,9 +274,11 @@ class MessageKeyStore:
         #Passes in arguments to their respective variables.
         self.run_query = run_query
         self.encryptor = encryptor
+        self.last_error = ""
 
     def get_or_create(self, recipient):
         #Reuse the recipient's latest active key or make one before saving a message.
+        self.last_error = ""
         scope_id = str(
             uuid.uuid5(uuid.NAMESPACE_URL, f"bluebubbles:message-recipient:{recipient}")
         )
@@ -296,12 +298,18 @@ class MessageKeyStore:
         result = self.run_query(active_key_query, {"scope_id": scope_id})
         #Catches an error where nothing is returned.
         if result.returncode != 0:
+            self.last_error = f"psql error querying key for '{recipient}': {result.stderr.strip()}"
             return None
         if result.stdout.strip():
             key_id, wrapped_key = result.stdout.strip().split("|", 1)
-            return key_id, self.encryptor.unwrap_data_key(
-                base64.b64decode(wrapped_key, validate=True)
-            )
+            try:
+                unwrapped = self.encryptor.unwrap_data_key(
+                    base64.b64decode(wrapped_key, validate=True)
+                )
+                return key_id, unwrapped
+            except Exception as e:
+                self.last_error = f"Key unwrap failed for recipient '{recipient}' ({type(e).__name__}: {e})"
+                raise
         #The a new data key is being created.
         data_key = self.encryptor.create_data_key()
         #This new key is then wrapped.
@@ -324,6 +332,7 @@ class MessageKeyStore:
             },
         )
         if result.returncode != 0:
+            self.last_error = f"psql error creating key for '{recipient}': {result.stderr.strip()}"
             return None
         if result.stdout.strip():
             return result.stdout.strip(), data_key
@@ -332,11 +341,16 @@ class MessageKeyStore:
         #Use the key so both messages can be sent.
         result = self.run_query(active_key_query, {"scope_id": scope_id})
         if result.returncode != 0 or not result.stdout.strip():
+            self.last_error = f"Recipient '{recipient}' not found in users table or key inactive"
             return None
         key_id, wrapped_key = result.stdout.strip().split("|", 1)
-        return key_id, self.encryptor.unwrap_data_key(
-            base64.b64decode(wrapped_key, validate=True)
-        )
+        try:
+            return key_id, self.encryptor.unwrap_data_key(
+                base64.b64decode(wrapped_key, validate=True)
+            )
+        except Exception as e:
+            self.last_error = f"Key unwrap failed for recipient '{recipient}' ({type(e).__name__}: {e})"
+            raise
 
     def unwrap(self, wrapped_key):
         #Decode database-safe base64 only immediately before AES-GCM key unwrapping.
@@ -355,18 +369,24 @@ class MessageSystem:            #New class for the whole message handling.
         self.encryptor = encryptor or MessageEncryptor()
         self.key_store = MessageKeyStore(run_query, self.encryptor)
         self.file_storage = file_storage or EncryptedFileStorage(self.encryptor)
+        self.last_error = ""
 
     def send(self, sender, recipient, content):
         #Encrypt the content before the insert and save no plaintext in message_content.
+        self.last_error = ""
         try:
             key_record = self.key_store.get_or_create(recipient)
             if key_record is None:
+                self.last_error = getattr(self.key_store, "last_error", "") or f"Key for recipient '{recipient}' could not be obtained"
+                print(f"[DEBUG send] {self.last_error}")
                 return False
             #The keyid is saved to a variable, which is then used to send the ciphertext and nonce that was used.
             encryption_key_id, data_key = key_record
             ciphertext, nonce = self.encryptor.encrypt_message(content, data_key)
         #Standard exception handling in case something goes wrong.
-        except Exception:
+        except Exception as e:
+            self.last_error = getattr(self.key_store, "last_error", "") or f"Key unwrap/encrypt error ({type(e).__name__}: {e})"
+            print(f"[DEBUG send] {self.last_error}")
             return False
         #Insert the encrypted message into the database.
         saved = self._insert_encrypted(
@@ -374,6 +394,7 @@ class MessageSystem:            #New class for the whole message handling.
         )
         #If the insert was successful, return the encrypted message.
         if not saved:
+            print(f"[DEBUG send] Insert failed: {self.last_error}")
             return False
         return {**saved, "sender": sender, "content": content}
 
@@ -506,7 +527,11 @@ class MessageSystem:            #New class for the whole message handling.
             },
         )
         #If everything succeeds, a bool value is returned to let it know whether the message was sent or not.
-        if result.returncode != 0 or not result.stdout.strip():
+        if result.returncode != 0:
+            self.last_error = f"PostgreSQL error: {result.stderr.strip()}"
+            return None
+        if not result.stdout.strip():
+            self.last_error = f"0 rows inserted (check sender '{sender}' and recipient '{recipient}' in users table)"
             return None
         #Split the output into the message ID, date, and time.
         message_id, sent_date, sent_time = result.stdout.strip().split("|", 2)

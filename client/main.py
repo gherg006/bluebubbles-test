@@ -5,14 +5,14 @@ import tkinter as tk
 from login_window import LoginWindow
 
 
-class ClientApplication:         # Creates and runs window
+class ClientApplication:         #Creates and runs window
     
 
     def __init__(self):
         self.root = tk.Tk()
         LoginWindow(self.root)
 
-    def run(self):                # Keeps the window open
+    def run(self):                #Keeps the window open
         
         self.root.mainloop()
 
